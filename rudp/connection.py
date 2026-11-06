@@ -6,6 +6,7 @@ import socket
 import time
 
 from .constants import DEFAULT_RTO, DEFAULT_WINDOW, FLAG_ACK, FLAG_FIN, FLAG_SYN
+from .hooks import Controller
 from .packet import Packet, PacketError
 from .receiver import Receiver
 from .sender import Sender
@@ -23,11 +24,13 @@ class Connection:
         *,
         timeout: float = DEFAULT_RTO,
         window_size: int = DEFAULT_WINDOW,
+        controller: Controller | None = None,
     ) -> None:
         self.sock = sock
         self.peer = peer
         self.timeout = timeout
         self.window_size = window_size
+        self.controller = controller
 
     def _send(self, packet: Packet, peer: tuple[str, int] | None = None) -> None:
         target = peer or self.peer
@@ -58,7 +61,7 @@ class Connection:
         raise ConnectionError("handshake timed out")
 
     def send_bytes(self, data: bytes) -> None:
-        sender = Sender(self.window_size)
+        sender = Sender(self.window_size, controller=self.controller)
         position = 0
         self.sock.settimeout(self.timeout)
         while position < len(data) or sender.in_flight:
