@@ -86,6 +86,8 @@ class BaseController(ABC):
     def __init__(self, logger: EventLogger | None = None) -> None:
         self._logger = logger
         self._change_observers: list[Callable[[dict[str, Any]], None]] = []
+        self._srtt: float | None = None
+        self._rttvar: float | None = None
 
     def add_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback for window/state change notifications."""
@@ -103,6 +105,18 @@ class BaseController(ABC):
                 observer(event_data)
             except Exception:
                 pass
+
+    def _update_rto(self, rtt: float | None, minimum: float, maximum: float) -> None:
+        if rtt is None or rtt < 0:
+            return
+        if self._srtt is None:
+            self._srtt = rtt
+            self._rttvar = rtt / 2
+        else:
+            assert self._rttvar is not None
+            self._rttvar = 0.75 * self._rttvar + 0.25 * abs(self._srtt - rtt)
+            self._srtt = 0.875 * self._srtt + 0.125 * rtt
+        self._timeout = min(maximum, max(minimum, self._srtt + max(0.001, 4 * self._rttvar)))
 
     @abstractmethod
     def window(self) -> int:
@@ -165,7 +179,8 @@ class NullController(BaseController):
         del sequence, size
 
     def on_ack(self, sequence: int, rtt: float | None = None) -> None:
-        del sequence, rtt
+        del sequence
+        self._update_rto(rtt, 0.05, 5.0)
 
     def on_duplicate_ack(self, ack_number: int) -> bool:
         del ack_number
@@ -175,7 +190,7 @@ class NullController(BaseController):
         del sequence
 
     def on_rto_timeout(self) -> None:
-        pass
+        self._timeout = min(5.0, self._timeout * 2)
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -277,6 +292,7 @@ class RenoController(BaseController):
         """
         # A fresh ACK resets the consecutive duplicate ACK counter
         self._dup_acks = 0
+        self._update_rto(rtt, 0.05, 5.0)
 
         if self._state == CongestionState.FAST_RECOVERY:
             # Deflate window back to ssthresh and enter congestion avoidance (RFC 5681 3.2)
@@ -340,12 +356,13 @@ class RenoController(BaseController):
         self._cwnd = self._min_cwnd
         self._dup_acks = 0
         self._state = CongestionState.SLOW_START
+        self._timeout = min(5.0, self._timeout * 2)
         self._log_state_change("timeout_loss")
 
     def _log_state_change(self, trigger: str, **extra: Any) -> None:
         """Log state update and notify observers."""
         record = {
-            "time": time.time(),
+            "time": time.monotonic(),
             "trigger": trigger,
             "cwnd": round(self._cwnd, 4),
             "window": self.window(),

@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 import time
 from typing import Callable
 
+from .constants import MAX_RTO, MIN_RTO
+
 
 @dataclass(frozen=True, slots=True)
 class RTTSample:
@@ -32,6 +34,9 @@ class RTTStats:
     min_rtt: float | None = None
     max_rtt: float | None = None
     mean_rtt: float | None = None
+    smoothed_rtt: float | None = None
+    rttvar: float | None = None
+    rto: float = 1.0
 
 
 @dataclass(slots=True)
@@ -163,6 +168,14 @@ class RTTSampler:
             st.mean_rtt = sample_rtt
         else:
             st.mean_rtt = (st.mean_rtt * (st.sample_count - 1) + sample_rtt) / st.sample_count
+        if st.smoothed_rtt is None:
+            st.smoothed_rtt = sample_rtt
+            st.rttvar = sample_rtt / 2
+        else:
+            assert st.rttvar is not None
+            st.rttvar = 0.75 * st.rttvar + 0.25 * abs(st.smoothed_rtt - sample_rtt)
+            st.smoothed_rtt = 0.875 * st.smoothed_rtt + 0.125 * sample_rtt
+        st.rto = min(MAX_RTO, max(MIN_RTO, st.smoothed_rtt + max(0.001, 4 * st.rttvar)))
 
         sample = RTTSample(sequence=sequence, rtt=sample_rtt, timestamp=timestamp)
         self._history.append(sample)

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any
 
 
@@ -18,6 +19,7 @@ class EventLogger:
     def log(self, event: str, **fields: Any) -> None:
         record = {
             "time": datetime.now(timezone.utc).isoformat(),
+            "monotonic": time.monotonic(),
             "event": event,
             **fields,
         }

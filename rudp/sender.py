@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import time
 
 from .constants import DEFAULT_RTO, DEFAULT_WINDOW, FLAG_DATA
+from .eventlog import EventLogger
 from .hooks import Controller, NullController
 from .packet import Packet, SACKBlock
 from .rtt import RTTSampler
@@ -27,9 +28,14 @@ class Sender:
         controller: Controller | None = None,
         initial_sequence: int = 1,
         rtt_sampler: RTTSampler | None = None,
+        logger: EventLogger | None = None,
+        connection_id: int = 0,
     ) -> None:
         self.controller = controller or NullController(window_size, DEFAULT_RTO)
         self.rtt_sampler = rtt_sampler if rtt_sampler is not None else RTTSampler()
+        self.logger = logger
+        self.connection_id = int(connection_id)
+        self.remote_window = max(1, int(window_size))
         self.base = initial_sequence
         self.next_sequence = initial_sequence
         self._outstanding: dict[int, _Outstanding] = {}
@@ -46,7 +52,13 @@ class Sender:
         while position < len(data):
             if self.can_send():
                 chunk = data[position : position + chunk_size]
-                packet = Packet(flags=FLAG_DATA, sequence=self.next_sequence, payload=chunk)
+                packet = Packet(
+                    flags=FLAG_DATA,
+                    connection_id=self.connection_id,
+                    sequence=self.next_sequence,
+                    payload=chunk,
+                    timestamp=int(time.monotonic() * 1000) & 0xFFFFFFFF,
+                )
                 now = time.monotonic()
                 self._outstanding[packet.sequence] = _Outstanding(packet, now)
                 self.rtt_sampler.on_packet_sent(packet.sequence, now)
@@ -55,6 +67,8 @@ class Sender:
                         self.controller.on_packet_sent(packet.sequence, len(chunk))
                     except Exception:
                         pass
+                if self.logger is not None:
+                    self.logger.log("send", sequence=packet.sequence, size=len(chunk))
                 self.next_sequence += 1
                 position += len(chunk)
                 packets.append(packet)
@@ -63,9 +77,21 @@ class Sender:
         return packets
 
     def can_send(self) -> bool:
-        return self.in_flight < max(1, self.controller.window())
+        if self.remote_window == 0:
+            return self.in_flight == 0
+        return self.in_flight < min(max(1, self.controller.window()), self.remote_window)
 
-    def acknowledge(self, acknowledgement: int, sack_blocks: tuple[SACKBlock, ...] = ()) -> int:
+    def set_remote_window(self, window: int) -> None:
+        self.remote_window = max(0, int(window))
+
+    def acknowledge(
+        self,
+        acknowledgement: int,
+        sack_blocks: tuple[SACKBlock, ...] = (),
+        remote_window: int | None = None,
+    ) -> int:
+        if remote_window is not None:
+            self.set_remote_window(remote_window)
         acknowledged = {
             sequence for sequence in self._outstanding if sequence < acknowledgement
         }
@@ -92,6 +118,13 @@ class Sender:
             # Karn's algorithm: rtt_sampler returns None if retransmitted
             rtt_sample = self.rtt_sampler.on_packet_acked(sequence, now)
             self.controller.on_ack(sequence, rtt_sample)
+            if self.logger is not None:
+                self.logger.log(
+                    "ack",
+                    sequence=sequence,
+                    acknowledgement=acknowledgement,
+                    rtt=rtt_sample,
+                )
 
         while self.base not in self._outstanding and self.base < self.next_sequence:
             self.base += 1
@@ -107,5 +140,8 @@ class Sender:
                 item.retransmitted = True
                 self.rtt_sampler.on_packet_retransmitted(sequence, now)
                 self.controller.on_loss(sequence)
+                if self.logger is not None:
+                    self.logger.log("timeout", sequence=sequence, rto=timeout)
+                    self.logger.log("retx", sequence=sequence)
                 result.append(item.packet)
         return result

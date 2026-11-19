@@ -1,9 +1,9 @@
 """Wire-format packets for the Reliable UDP protocol.
 
-The fixed header is 32 bytes and all integer fields use network byte order.
-SACK blocks follow the fixed header as inclusive ``(start, end)`` sequence
-number ranges.  The CRC32 covers the header, SACK blocks, and payload; while
-calculating it, the checksum field is set to zero.
+The fixed header is the 32-byte network-order format
+``>BBHIIHHIIIB3x``. SACK blocks follow the fixed header as inclusive
+``(start, end)`` sequence-number ranges. The CRC32 covers the header, SACK
+blocks, and payload with the checksum field zeroed.
 """
 
 from __future__ import annotations
@@ -13,15 +13,14 @@ import struct
 import zlib
 
 
-MAGIC = b"RUDP"
 VERSION = 1
 HEADER_SIZE = 32
 MAX_PAYLOAD = 1200
-MAX_SACK_BLOCKS = 32
+MAX_SACK_BLOCKS = 3
 
-# magic, version, flags, header length, sequence, acknowledgement, window,
-# payload length, SACK count, reserved, checksum, reserved
-_HEADER = struct.Struct("!4sBBHIIHHHHII")
+# version, flags, connection id, sequence, acknowledgement, window,
+# payload length, timestamp, timestamp echo, checksum, SACK count, reserved
+_HEADER = struct.Struct(">BBHIIHHIIIB3x")
 _SACK_BLOCK = struct.Struct("!II")
 _CHECKSUM_OFFSET = 24
 
@@ -60,17 +59,23 @@ class Packet:
     """A RUDP packet and its transport metadata."""
 
     flags: int = 0
+    connection_id: int = 0
     sequence: int = 0
     acknowledgement: int = 0
     window: int = 0
     payload: bytes = b""
+    timestamp: int = 0
+    timestamp_echo: int = 0
     sack_blocks: tuple[SACKBlock, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         _validate_uint8(self.flags, "flags")
+        _validate_uint16(self.connection_id, "connection id")
         _validate_uint32(self.sequence, "sequence")
         _validate_uint32(self.acknowledgement, "acknowledgement")
         _validate_uint16(self.window, "window")
+        _validate_uint32(self.timestamp, "timestamp")
+        _validate_uint32(self.timestamp_echo, "timestamp echo")
         if not isinstance(self.payload, bytes):
             raise PacketError("payload must be bytes")
         if len(self.payload) > MAX_PAYLOAD:
@@ -96,27 +101,21 @@ class Packet:
 
         return self.acknowledgement
 
-    @property
-    def header_length(self) -> int:
-        return HEADER_SIZE + len(self.sack_blocks) * _SACK_BLOCK.size
-
     def encode(self) -> bytes:
         """Serialize this packet, including its calculated CRC32."""
 
-        header_length = self.header_length
         header = _HEADER.pack(
-            MAGIC,
             VERSION,
             self.flags,
-            header_length,
+            self.connection_id,
             self.sequence,
             self.acknowledgement,
             self.window,
             len(self.payload),
+            self.timestamp,
+            self.timestamp_echo,
+            0,
             len(self.sack_blocks),
-            0,
-            0,
-            0,
         )
         sacks = b"".join(block.pack() for block in self.sack_blocks)
         checksum = zlib.crc32(header + sacks + self.payload) & 0xFFFFFFFF
@@ -138,37 +137,30 @@ class Packet:
             raise PacketFormatError("packet is shorter than the fixed header")
 
         (
-            magic,
             version,
             flags,
-            header_length,
+            connection_id,
             sequence,
             acknowledgement,
             window,
             payload_length,
-            sack_count,
-            reserved,
+            timestamp,
+            timestamp_echo,
             checksum,
-            trailing_reserved,
+            sack_count,
         ) = _HEADER.unpack_from(raw)
 
-        if magic != MAGIC:
-            raise PacketFormatError("invalid packet magic")
         if version != VERSION:
             raise PacketFormatError(f"unsupported packet version: {version}")
-        if reserved or trailing_reserved:
-            raise PacketFormatError("reserved header fields must be zero")
-        expected_header_length = HEADER_SIZE + sack_count * _SACK_BLOCK.size
-        if header_length != expected_header_length:
-            raise PacketFormatError("header length does not match SACK count")
+        if sack_count > MAX_SACK_BLOCKS:
+            raise PacketFormatError(f"at most {MAX_SACK_BLOCKS} SACK blocks are supported")
+        header_length = HEADER_SIZE + sack_count * _SACK_BLOCK.size
         if header_length > len(raw):
             raise PacketFormatError("packet ends before its SACK blocks")
         if payload_length > MAX_PAYLOAD:
             raise PacketFormatError(f"payload exceeds {MAX_PAYLOAD} bytes")
         if len(raw) != header_length + payload_length:
             raise PacketFormatError("payload length does not match datagram length")
-        if sack_count > MAX_SACK_BLOCKS:
-            raise PacketFormatError(f"at most {MAX_SACK_BLOCKS} SACK blocks are supported")
 
         checksum_header = bytearray(raw[:HEADER_SIZE])
         struct.pack_into("!I", checksum_header, _CHECKSUM_OFFSET, 0)
@@ -189,10 +181,13 @@ class Packet:
         payload = raw[header_length:]
         return cls(
             flags=flags,
+            connection_id=connection_id,
             sequence=sequence,
             acknowledgement=acknowledgement,
             window=window,
             payload=payload,
+            timestamp=timestamp,
+            timestamp_echo=timestamp_echo,
             sack_blocks=blocks,
         )
 

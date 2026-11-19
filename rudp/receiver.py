@@ -30,7 +30,13 @@ class Receiver:
             self.next_sequence += 1
         return bytes(output), self.ack()
 
-    def ack(self) -> Packet:
+    def ack(
+        self,
+        *,
+        connection_id: int = 0,
+        timestamp_echo: int = 0,
+        timestamp: int = 0,
+    ) -> Packet:
         blocks: list[SACKBlock] = []
         for sequence in sorted(self._buffer):
             if blocks and sequence == blocks[-1].end + 1:
@@ -39,7 +45,10 @@ class Receiver:
                 blocks.append(SACKBlock(sequence, sequence))
         return Packet(
             flags=FLAG_ACK,
+            connection_id=connection_id,
             acknowledgement=self.next_sequence,
             window=max(0, self.window_size - len(self._buffer)),
+            timestamp=timestamp,
+            timestamp_echo=timestamp_echo,
             sack_blocks=tuple(blocks),
         )
