@@ -4,6 +4,7 @@ import time
 import unittest
 
 from rudp.controller import CongestionState, RenoController
+from rudp.packet import SACKBlock
 from rudp.sender import Sender
 
 
@@ -87,6 +88,22 @@ class SenderTests(unittest.TestCase):
         sender.acknowledge(1)
         self.assertEqual(reno.dup_acks, 3)
         self.assertEqual(reno.state, CongestionState.FAST_RECOVERY)
+
+    def test_three_higher_acks_trigger_fast_retransmission(self) -> None:
+        sender = Sender(window_size=4)
+        packets = sender.make_packets(b"abcd", chunk_size=1)
+        self.assertEqual(len(packets), 4)
+
+        sender.acknowledge(
+            1,
+            (
+                SACKBlock(2, 2),
+                SACKBlock(3, 3),
+                SACKBlock(4, 4),
+            ),
+        )
+
+        self.assertEqual(sender.retransmissions(), [packets[0]])
 
 
 if __name__ == "__main__":

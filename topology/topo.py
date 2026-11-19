@@ -56,7 +56,7 @@ def _configure_routes(net: Mininet) -> None:
     r2_intfs = r2.intfList()
     r1.cmd(f"ip addr add 10.0.1.1/24 dev {r1_intfs[0].name} 2>/dev/null || true")
     r1.cmd(f"ip addr add 10.0.2.1/24 dev {r1_intfs[-1].name} 2>/dev/null || true")
-    r2.cmd(f"ip addr add 10.0.2.2/24 dev {r2_intfs[0].name} 2>/dev/null || true")
+    r2.cmd(f"ip addr add 10.0.2.2/24 dev {r2_intfs[-1].name} 2>/dev/null || true")
     r2.cmd(f"ip addr add 10.0.3.1/24 dev {r2_intfs[-1].name} 2>/dev/null || true")
     for host in ("h1", "h3"):
         net[host].cmd("ip route replace default via 10.0.1.1")

@@ -39,6 +39,8 @@ class Sender:
         self.base = initial_sequence
         self.next_sequence = initial_sequence
         self._outstanding: dict[int, _Outstanding] = {}
+        self._fast_retransmit: set[int] = set()
+        self._higher_acks: dict[int, set[int]] = {}
 
     @property
     def in_flight(self) -> int:
@@ -102,6 +104,7 @@ class Sender:
             )
 
         now = time.monotonic()
+        base_before_ack = self.base
 
         # If no outstanding packets were acknowledged, this is a duplicate ACK
         if not acknowledged:
@@ -125,8 +128,18 @@ class Sender:
                     acknowledgement=acknowledgement,
                     rtt=rtt_sample,
                 )
+                if rtt_sample is not None:
+                    self.logger.log("rtt", sequence=sequence, rtt=rtt_sample)
+
+        if base_before_ack in self._outstanding:
+            higher = self._higher_acks.setdefault(base_before_ack, set())
+            higher.update(sequence for sequence in acknowledged if sequence > base_before_ack)
+            if len(higher) >= 3:
+                self._fast_retransmit.add(base_before_ack)
+                self._higher_acks.pop(base_before_ack, None)
 
         while self.base not in self._outstanding and self.base < self.next_sequence:
+            self._higher_acks.pop(self.base, None)
             self.base += 1
         return len(acknowledged)
 
@@ -135,13 +148,21 @@ class Sender:
         timeout = max(0.001, self.controller.rto())
         result: list[Packet] = []
         for sequence, item in self._outstanding.items():
-            if now - item.sent_at >= timeout:
+            fast_retransmit = sequence in self._fast_retransmit
+            timed_out = now - item.sent_at >= timeout
+            if fast_retransmit or timed_out:
+                self._fast_retransmit.discard(sequence)
                 item.sent_at = now
                 item.retransmitted = True
                 self.rtt_sampler.on_packet_retransmitted(sequence, now)
                 self.controller.on_loss(sequence)
                 if self.logger is not None:
-                    self.logger.log("timeout", sequence=sequence, rto=timeout)
-                    self.logger.log("retx", sequence=sequence)
+                    if timed_out:
+                        self.logger.log("timeout", sequence=sequence, rto=timeout)
+                    self.logger.log(
+                        "retx",
+                        sequence=sequence,
+                        reason="timeout" if timed_out else "fast_retransmit",
+                    )
                 result.append(item.packet)
         return result
