@@ -1,6 +1,6 @@
 # Final Week Audit Status
 
-Audit performed on `final_week` after the baseline test run (`26 passed`).
+Audit performed on `ghufran_final` after the baseline test run (`26 passed`).
 
 | Requirement | Status | Existing evidence / gaps |
 |---|---|---|
@@ -9,7 +9,7 @@ Audit performed on `final_week` after the baseline test run (`26 passed`).
 | C. Experiments and measurements | DONE | [`experiments/run_experiments.py`](/workspaces/RUDP/experiments/run_experiments.py) defines the requested loss, RTT, rate, and fairness matrix, defaults to three 10 MiB runs, invokes RUDP and iperf3 Reno/CUBIC, computes Jain fairness, and writes `results/raw.csv`, `results/summary.csv`, `results/logs/`, and `results/pcaps/`. |
 | D. Packet captures and dissector | DONE | [`tools/capture_runs.sh`](/workspaces/RUDP/tools/capture_runs.sh) captures handshake, loss-recovery, window-growth, and teardown runs as pcapng on a router interface; [`tools/rudp_dissector.lua`](/workspaces/RUDP/tools/rudp_dissector.lua) dissects the 32-byte header and SACK blocks on UDP port 9000. |
 | E. Analysis and plots | DONE | [`analysis/plot_results.py`](/workspaces/RUDP/analysis/plot_results.py) generates PNGs for goodput versus loss/RTT/rate, cwnd over time, RTT estimate versus measured RTT, and Jain fairness from CSVs and JSON-lines logs. |
-| F. Reproducibility | PARTIAL | [`requirements.txt`](/workspaces/RUDP/requirements.txt) contains only pytest and [`README.md`](/workspaces/RUDP/README.md) has basic local transfer instructions. Ubuntu setup, one-command execution, exact topology/experiment instructions, and [`docs/AI_USE_LOG.md`](/workspaces/RUDP/docs/AI_USE_LOG.md) are missing. |
+| F. Reproducibility | DONE | [`scripts/setup_ubuntu.sh`](/workspaces/RUDP/scripts/setup_ubuntu.sh) installs Ubuntu dependencies and creates `.venv`; [`scripts/run_all.sh`](/workspaces/RUDP/scripts/run_all.sh) runs topology validation, experiments, and plots; [`requirements.txt`](/workspaces/RUDP/requirements.txt), [`README.md`](/workspaces/RUDP/README.md), and [`docs/AI_USE_LOG.md`](/workspaces/RUDP/docs/AI_USE_LOG.md) provide the requested reproducibility materials. |
 
 ## Existing Supporting Work
 
