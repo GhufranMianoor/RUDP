@@ -10,7 +10,7 @@ The merge completed without conflicts.
 
 ## Work Completed
 
-The Week 1 Member 2 implementation was integrated:
+The Week 1 Member 2 implementation was integrate
 
 - Added RTT sampling support in `rudp/rtt.py`.
   - Tracks sent and acknowledged packets.
