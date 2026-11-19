@@ -5,7 +5,7 @@ Audit performed on `final_week` after the baseline test run (`26 passed`).
 | Requirement | Status | Existing evidence / gaps |
 |---|---|---|
 | A. Protocol core | DONE | [`rudp/packet.py`](/workspaces/RUDP/rudp/packet.py), [`rudp/sender.py`](/workspaces/RUDP/rudp/sender.py), [`rudp/receiver.py`](/workspaces/RUDP/rudp/receiver.py), and [`rudp/connection.py`](/workspaces/RUDP/rudp/connection.py) now implement the specified 32-byte header, CRC/SACK, connection IDs, retransmitted handshake, FIN linger, adaptive RTO, effective flow-control windows, zero-window probing, and selective-repeat transfer. [`tools/lossy_proxy.py`](/workspaces/RUDP/tools/lossy_proxy.py) provides loss, duplication, delay, and corruption injection. Empty, baseline, and 10 MB SHA-256 transfer tests pass. |
-| B. Mininet topology | MISSING | [`topology/`](/workspaces/RUDP/topology/) contains only `.gitkeep`; no topology script, routing, impairments, or `--check` mode exists. |
+| B. Mininet topology | DONE | [`topology/topo.py`](/workspaces/RUDP/topology/topo.py) defines h1/h3 and h2/h4 subnets, R1/R2 forwarding and routes, bidirectional `tc` impairments, root validation, and `--check` diagnostics plus SHA-256 transfer validation. |
 | C. Experiments and measurements | MISSING | No experiment runner or `results/` output structure exists. |
 | D. Packet captures and dissector | MISSING | No capture workflow or Wireshark Lua dissector exists. |
 | E. Analysis and plots | MISSING | [`analysis/`](/workspaces/RUDP/analysis/) contains only `.gitkeep`; no plotting script exists. |
