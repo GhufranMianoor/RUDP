@@ -6,12 +6,16 @@ experiments/run_experiments.py``). For every condition it builds a fresh
 network with ``topology/topo.py`` (delay / loss / rate on the R1-R2 link),
 then for each run:
 
-* RUDP     h1 -> h2, UDP 9000, verified by SHA-256
+* ping     h1 -> h2, 20 probes on the idle path: the independently measured RTT
+* RUDP     h1 -> h2, UDP 9000, verified by SHA-256 (Reno controller; add
+  ``--rudp-cc reno cubic`` to also run the CUBIC controller)
 * TCP Reno h3 -> h4, iperf3 on TCP 5201 (``-C reno``)
 * TCP CUBIC h3 -> h4, iperf3 on TCP 5201 (``-C cubic``)
 
 The fairness experiment (Exp4) instead runs RUDP (h1 -> h2) and iperf3
-(h3 -> h4) *at the same time* over the shared bottleneck.
+(h3 -> h4) *at the same time* over the shared bottleneck, at RTT 20, 100 and
+200 ms, each against TCP Reno (``fairness_reno_rtt*``) and against TCP CUBIC
+(``fairness_cubic_rtt*``).
 
 Goodput is application bytes divided by the transfer time: for RUDP the
 sender-measured time from the end of the handshake to the FIN being
@@ -64,6 +68,7 @@ class Condition:
     loss_pct: float  # per direction
     rate_mbps: float
     concurrent: bool = False
+    tcp_cc: str = "reno"  # Exp4: the TCP algorithm competing with RUDP
 
     @property
     def rtt_ms(self) -> float:
@@ -75,7 +80,10 @@ def conditions() -> list[Condition]:
         *(Condition("Exp1", f"loss_{loss:g}", 50, loss, 10) for loss in (0, 2, 5)),
         *(Condition("Exp2", f"rtt_{rtt:g}ms", rtt / 2, 0, 10) for rtt in (20, 100, 200)),
         *(Condition("Exp3", f"rate_{rate:g}mbps", 50, 0, rate) for rate in (5, 10, 20)),
-        Condition("Exp4", "fairness", 50, 0, 10, concurrent=True),
+        # Fairness under 3 network conditions (RTT 20 / 100 / 200 ms), each
+        # against TCP Reno and against TCP CUBIC.
+        *(Condition("Exp4", f"fairness_{cc}_rtt{rtt:g}ms", rtt / 2, 0, 10, concurrent=True, tcp_cc=cc)
+          for cc in ("reno", "cubic") for rtt in (20, 100, 200)),
     ]
 
 
@@ -137,7 +145,8 @@ def stop_capture(process) -> None:
         process.kill()
 
 
-def start_rudp(net, payload: Path, work: Path, tag: str, window: int, log: Path | None):
+def start_rudp(net, payload: Path, work: Path, tag: str, window: int, log: Path | None,
+               cc: str = "reno"):
     """Start receiver on h2 and sender on h1. Returns handles; sender not yet waited on."""
 
     received = work / f"{tag}_received.bin"
@@ -151,17 +160,19 @@ def start_rudp(net, payload: Path, work: Path, tag: str, window: int, log: Path 
     )
     time.sleep(0.5)
     command = [sys.executable, str(ROOT / "apps/send_file.py"), DST_RUDP, str(RUDP_PORT),
-               str(payload), "--cc", "reno", "--summary", str(summary), "--window", str(window)]
+               str(payload), "--cc", cc, "--summary", str(summary), "--window", str(window)]
     if log is not None:
         command += ["--log", str(log)]
     sender = net[H1].popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     return {"receiver": receiver, "sender": sender, "received": received, "summary": summary,
-            "command": " ".join(command), "started": time.monotonic()}
+            "command": " ".join(command), "started": time.monotonic(), "cc": cc}
 
 
 def finish_rudp(handle: dict, payload_sha: str, timeout: float) -> dict:
     sender, receiver = handle["sender"], handle["receiver"]
-    row: dict[str, object] = {"protocol": "RUDP", "command": handle["command"], "ok": False}
+    # "RUDP" is the Reno controller (the default); other controllers are labelled.
+    label = "RUDP" if handle.get("cc", "reno") == "reno" else f"RUDP-{handle['cc'].upper()}"
+    row: dict[str, object] = {"protocol": label, "command": handle["command"], "ok": False}
     try:
         sender.wait(timeout=timeout)
         receiver.wait(timeout=60)
@@ -267,6 +278,31 @@ def finish_iperf(handle: dict, timeout: float) -> dict:
     return row
 
 
+def parse_ping(output: str) -> dict:
+    """Extract loss and min/avg/max/mdev RTT (ms) from Linux ``ping`` output."""
+
+    import re
+    result: dict[str, float | str] = {"ping_loss_pct": "", "ping_min_rtt_ms": "",
+                                      "ping_avg_rtt_ms": "", "ping_max_rtt_ms": "",
+                                      "ping_mdev_ms": ""}
+    loss = re.search(r"([\d.]+)% packet loss", output)
+    if loss:
+        result["ping_loss_pct"] = float(loss.group(1))
+    rtt = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", output)
+    if rtt:
+        result.update(ping_min_rtt_ms=float(rtt.group(1)), ping_avg_rtt_ms=float(rtt.group(2)),
+                      ping_max_rtt_ms=float(rtt.group(3)), ping_mdev_ms=float(rtt.group(4)))
+    return result
+
+
+def measure_ping(net, count: int) -> dict:
+    """RTT h1 -> h2 measured by ICMP on the idle path, independent of RUDP's estimator."""
+
+    if count <= 0:
+        return {}
+    return parse_ping(net[H1].cmd(f"ping -n -q -c {count} -i 0.2 -W 2 {DST_RUDP}"))
+
+
 # ------------------------------------------------------------------------ main
 
 def run_condition(cond: Condition, args, payload: Path, payload_sha: str, work: Path) -> list[dict]:
@@ -288,6 +324,8 @@ def run_condition(cond: Condition, args, payload: Path, payload_sha: str, work: 
                 "payload_sha256": payload_sha, "bottleneck_queue_packets": args.queue_packets,
                 "concurrent": cond.concurrent,
             }
+            # Independent RTT reference on the idle path, before any transfer.
+            base.update(measure_ping(net, args.ping_count))
             # Every run is logged (logging is buffered and does not slow the
             # sender), so logged and unlogged runs are measured alike.
             log = args.results / "logs" / f"{stem}_rudp.jsonl"
@@ -300,7 +338,7 @@ def run_condition(cond: Condition, args, payload: Path, payload_sha: str, work: 
                 server = start_iperf_server(net, keep_output=True)  # ready before either client starts
                 t0 = time.time()
                 rudp = start_rudp(net, payload, work, stem, args.window, log)
-                tcp = start_iperf_client(net, server, "reno", nbytes)  # starts with RUDP's sender
+                tcp = start_iperf_client(net, server, cond.tcp_cc, nbytes)  # starts with RUDP's sender
                 tcp_row = finish_iperf(tcp, args.run_timeout)
                 rudp_row = finish_rudp(rudp, payload_sha, args.run_timeout)
                 stop_capture(capture)
@@ -333,11 +371,16 @@ def run_condition(cond: Condition, args, payload: Path, payload_sha: str, work: 
                     row["fairness_index_own_duration"] = own_duration
                 results = [rudp_row, tcp_row]
             else:
-                capture = start_capture(net, pcap) if first else None
-                rudp_row = finish_rudp(
-                    start_rudp(net, payload, work, stem, args.window, log), payload_sha, args.run_timeout)
-                stop_capture(capture)
-                results.append(rudp_row)
+                for cc in args.rudp_cc:
+                    # The capture and the default log name belong to the Reno run.
+                    tag = stem if cc == "reno" else f"{stem}_{cc}"
+                    cc_log = log if cc == "reno" else args.results / "logs" / f"{tag}_rudp.jsonl"
+                    cc_log.unlink(missing_ok=True)
+                    capture = start_capture(net, pcap) if first and cc == "reno" else None
+                    results.append(finish_rudp(
+                        start_rudp(net, payload, work, tag, args.window, cc_log, cc),
+                        payload_sha, args.run_timeout))
+                    stop_capture(capture)
                 for algorithm in ("reno", "cubic"):
                     server = start_iperf_server(net)
                     results.append(finish_iperf(
@@ -379,7 +422,11 @@ def write_outputs(rows: list[dict], output: Path) -> None:
             "mean_retransmissions", "stddev_retransmissions",
             "mean_rtt_estimate_s", "stddev_rtt_estimate_s",
             "mean_queue_delay_ms", "stddev_queue_delay_ms",
-            "mean_fairness_index", "mean_share_of_total",
+            "mean_fairness_index", "stddev_fairness_index",
+            "min_fairness_index", "max_fairness_index",
+            "mean_share_of_total", "stddev_share_of_total",
+            "mean_min_rtt_ms", "mean_ping_avg_rtt_ms", "stddev_ping_avg_rtt_ms",
+            "mean_ping_min_rtt_ms",
         ])
         for (experiment, condition, protocol), group in sorted(groups.items()):
             good = [row for row in group if row.get("ok")]
@@ -394,11 +441,19 @@ def write_outputs(rows: list[dict], output: Path) -> None:
             queue = spread(column("queue_delay_ms"))
             fairness = column("fairness_index")
             share = column("share_of_total")
+            min_rtt = column("min_rtt_s")
+            ping_avg = spread(column("ping_avg_rtt_ms"))
+            ping_min = column("ping_min_rtt_ms")
             writer.writerow([
                 experiment, condition, protocol, len(group), len(good),
                 *goodput, *completion, *retx, *rtt, *queue,
-                statistics.mean(fairness) if fairness else "",
-                statistics.mean(share) if share else "",
+                *spread(fairness),
+                min(fairness) if fairness else "",
+                max(fairness) if fairness else "",
+                *spread(share),
+                statistics.mean(min_rtt) * 1000 if min_rtt else "",
+                *ping_avg,
+                statistics.mean(ping_min) if ping_min else "",
             ])
 
 
@@ -414,6 +469,11 @@ def main() -> int:
                              "(RUDP event logs are written for every run)")
     parser.add_argument("--queue-packets", type=int, default=100)
     parser.add_argument("--window", type=int, default=1024)
+    parser.add_argument("--rudp-cc", nargs="+", choices=["reno", "cubic"], default=["reno"],
+                        help="RUDP congestion controllers to run in Exp1-3 (default: reno). "
+                             "Exp4 always uses Reno RUDP.")
+    parser.add_argument("--ping-count", type=int, default=20,
+                        help="ICMP probes h1 -> h2 before each run for the measured RTT (0 = off)")
     parser.add_argument("--run-timeout", type=float, default=900,
                         help="seconds before one transfer is declared failed")
     parser.add_argument("--list", action="store_true",
@@ -427,9 +487,10 @@ def main() -> int:
 
     if args.list:
         for cond in selected:
-            print(f"{cond.experiment:5} {cond.name:16} RTT {cond.rtt_ms:6g} ms  "
+            print(f"{cond.experiment:5} {cond.name:24} RTT {cond.rtt_ms:6g} ms  "
                   f"loss {cond.loss_pct:g}%  rate {cond.rate_mbps:g} Mbit/s  x{args.runs} runs"
-                  + ("  (RUDP and TCP concurrently)" if cond.concurrent else ""))
+                  + (f"  (RUDP and TCP {cond.tcp_cc.upper()} concurrently)" if cond.concurrent
+                     else f"  (RUDP {'+'.join(args.rudp_cc)}, TCP Reno, TCP CUBIC)"))
         return 0
 
     import os

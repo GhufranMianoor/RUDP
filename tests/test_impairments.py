@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 
 from rudp.connection import Connection, ConnectionError
 from rudp.constants import FLAG_ACK, FLAG_FIN, FLAG_SYN
-from rudp.controller import RenoController
+from rudp.controller import CubicController, RenoController
 from tools.lossy_proxy import FORWARD, REVERSE, LossyProxy
 
 WATCHDOG = 60.0
@@ -42,7 +42,8 @@ def drop_first(direction: str, flags: int, count: int = 1):
 
 
 class ImpairmentTests(unittest.TestCase):
-    def transfer(self, size: int = 200_000, *, payload: bytes | None = None, **proxy_args):
+    def transfer(self, size: int = 200_000, *, payload: bytes | None = None, controller=None,
+                 **proxy_args):
         payload = os.urandom(size) if payload is None else payload
         outcome: dict = {}
 
@@ -61,7 +62,7 @@ class ImpairmentTests(unittest.TestCase):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 connection = Connection(
                     sock,
-                    controller=RenoController(initial_ssthresh=1024.0),
+                    controller=controller or RenoController(initial_ssthresh=1024.0),
                     stall_timeout=20.0,
                 )
                 connection.connect(("127.0.0.1", proxy.port))
@@ -92,6 +93,16 @@ class ImpairmentTests(unittest.TestCase):
     def test_heavy_loss_many_gaps(self) -> None:
         # 20% loss routinely produces more than three simultaneous gaps.
         self.transfer(60_000, drop=0.20, seed=7)
+
+    def test_cubic_controller_under_loss(self) -> None:
+        for seed in (1, 2):
+            with self.subTest(seed=seed):
+                connection, proxy, _ = self.transfer(
+                    300_000, drop=0.05, seed=seed,
+                    controller=CubicController(initial_ssthresh=1024.0),
+                )
+                self.assertGreater(proxy.stats["dropped"], 0)
+                self.assertGreater(connection.sender.stats["retransmissions"], 0)
 
     def test_duplication(self) -> None:
         self.transfer(200_000, duplicate=0.2, seed=4)

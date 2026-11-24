@@ -83,58 +83,127 @@ def plot_cwnd(logs: Path, output: Path) -> None:
 
 
 def plot_rtt(rows: list[dict[str, str]], output: Path) -> None:
-    """RUDP smoothed RTT and minimum RTT against the configured RTT (Exp2)."""
+    """Exp2: RUDP's RTT estimate against the RTT measured by ping and the configured RTT."""
 
     import matplotlib.pyplot as plt
 
-    points = sorted(
-        {(float(r["rtt_ms"]), float(r["rtt_estimate_s"]) * 1000,
-          float(r["min_rtt_s"]) * 1000 if r.get("min_rtt_s") else float("nan"))
-         for r in rows
-         if r["experiment"] == "Exp2" and r["protocol"] == "RUDP"
-         and r.get("ok") in ("True", "true", "1") and r.get("rtt_estimate_s")}
-    )
+    def ok(row: dict[str, str]) -> bool:
+        return row.get("ok") in ("True", "true", "1")
+
+    series: dict[str, dict[float, list[float]]] = {
+        "RUDP smoothed RTT (includes queueing)": {},
+        "RUDP minimum RTT sample": {},
+        "ping average RTT (idle path)": {},
+    }
+    for row in rows:
+        if row["experiment"] != "Exp2" or row["protocol"] != "RUDP" or not ok(row):
+            continue
+        configured = float(row["rtt_ms"])
+        for label, field, scale in (
+            ("RUDP smoothed RTT (includes queueing)", "rtt_estimate_s", 1000.0),
+            ("RUDP minimum RTT sample", "min_rtt_s", 1000.0),
+            ("ping average RTT (idle path)", "ping_avg_rtt_ms", 1.0),
+        ):
+            if row.get(field) not in (None, ""):
+                series[label].setdefault(configured, []).append(float(row[field]) * scale)
+
     figure, axis = plt.subplots()
-    if points:
-        configured, smoothed, minimum = zip(*points)
-        axis.plot(configured, smoothed, "o-", label="RUDP smoothed RTT (includes queueing)")
-        axis.plot(configured, minimum, "s--", label="RUDP minimum RTT sample")
+    markers = iter(("o-", "s--", "^-."))
+    plotted = False
+    for label, values in series.items():
+        marker = next(markers)
+        if not values:
+            continue
+        xs = sorted(values)
+        axis.errorbar(xs, [mean(values[x]) for x in xs],
+                      yerr=[stdev(values[x]) if len(values[x]) > 1 else 0 for x in xs],
+                      fmt=marker, capsize=3, label=label)
+        plotted = True
+    if plotted:
+        configured = sorted({x for values in series.values() for x in values})
         axis.plot(configured, configured, "k:", label="configured RTT (y = x)")
         axis.legend()
-    axis.set(title="RTT estimate versus configured RTT",
+    axis.set(title="RTT estimate versus measured RTT (Exp2)",
              xlabel="Configured RTT (ms)", ylabel="RTT (ms)")
     axis.grid(alpha=0.3)
     figure.tight_layout()
-    figure.savefig(output / "rtt_estimate_vs_configured.png", dpi=160)
+    figure.savefig(output / "rtt_estimate_vs_measured.png", dpi=160)
     plt.close(figure)
 
 
 def plot_fairness(rows: list[dict[str, str]], output: Path) -> None:
+    """One bar chart per Exp4 condition (RUDP against TCP Reno, RUDP against TCP CUBIC)."""
+
     import matplotlib.pyplot as plt
 
-    runs: dict[str, dict[str, float]] = {}
+    exp4 = [row for row in rows if row["experiment"] == "Exp4"]
+    for condition in sorted({row["condition"] for row in exp4}):
+        runs: dict[str, dict[str, float]] = {}
+        tcp_name = "TCP"
+        for row in exp4:
+            if row["condition"] != condition or row.get("ok") not in ("True", "true", "1"):
+                continue
+            value = row.get("overlap_mbps") or row["goodput_mbps"]  # overlap window when measured
+            key = "RUDP" if row["protocol"].startswith("RUDP") else "TCP"
+            if key == "TCP":
+                tcp_name = row["protocol"].replace("-", " ").replace("RENO", "Reno")
+            runs.setdefault(row["run"], {})[key] = float(value)
+        figure, axis = plt.subplots()
+        ordered = sorted(runs, key=lambda r: int(r) if str(r).isdigit() else r)
+        positions = range(len(ordered))
+        axis.bar([p - 0.2 for p in positions], [runs[r].get("RUDP", 0) for r in ordered], 0.4,
+                 label="RUDP (Reno)")
+        axis.bar([p + 0.2 for p in positions], [runs[r].get("TCP", 0) for r in ordered], 0.4,
+                 label=tcp_name)
+        axis.set_xticks(list(positions), [f"run {r}" for r in ordered])
+        values = [float(row["fairness_index"]) for row in exp4
+                  if row["condition"] == condition and row.get("fairness_index") not in (None, "")
+                  and row["protocol"].startswith("RUDP")]
+        title = f"RUDP vs {tcp_name} on a shared bottleneck"
+        axis.set(title=f"{title} (Jain {mean(values):.2f})" if values else title,
+                 ylabel="Throughput while both flows run (Mbit/s)")
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(output / f"{condition}.png", dpi=160)
+        plt.close(figure)
+
+
+def plot_fairness_summary(rows: list[dict[str, str]], output: Path) -> None:
+    """Exp4 across conditions: Jain's index and RUDP's share against RTT, one line per TCP variant."""
+
+    import matplotlib.pyplot as plt
+
+    data: dict[str, dict[float, dict[str, list[float]]]] = {}
     for row in rows:
-        if row["experiment"] != "Exp4" or row.get("ok") not in ("True", "true", "1"):
+        if (row["experiment"] != "Exp4" or not row["protocol"].startswith("RUDP")
+                or row.get("ok") not in ("True", "true", "1")
+                or row.get("fairness_index") in (None, "")):
             continue
-        value = row.get("overlap_mbps") or row["goodput_mbps"]  # overlap window when measured
-        runs.setdefault(row["run"], {})[row["protocol"]] = float(value)
-    figure, axis = plt.subplots()
-    labels = [f"run {run}" for run in sorted(runs)]
-    rudp = [runs[run].get("RUDP", 0) for run in sorted(runs)]
-    tcp = [runs[run].get("TCP-RENO", 0) for run in sorted(runs)]
-    positions = range(len(labels))
-    axis.bar([p - 0.2 for p in positions], rudp, 0.4, label="RUDP")
-    axis.bar([p + 0.2 for p in positions], tcp, 0.4, label="TCP Reno")
-    axis.set_xticks(list(positions), labels)
-    values = [float(row["fairness_index"]) for row in rows
-              if row["experiment"] == "Exp4" and row.get("fairness_index") not in (None, "")
-              and row["protocol"] == "RUDP"]
-    axis.set(title=f"Concurrent flows on a shared bottleneck (Jain index {mean(values):.2f})"
-             if values else "Concurrent flows on a shared bottleneck",
-             ylabel="Throughput while both flows run (Mbit/s)")
-    axis.legend()
+        tcp = "TCP CUBIC" if "cubic" in row["condition"] else "TCP Reno"
+        point = data.setdefault(tcp, {}).setdefault(float(row["rtt_ms"]), {"jain": [], "share": []})
+        point["jain"].append(float(row["fairness_index"]))
+        if row.get("share_of_total") not in (None, ""):
+            point["share"].append(float(row["share_of_total"]) * 100)
+    if not data:
+        return
+    figure, (left, right) = plt.subplots(1, 2, figsize=(10, 4))
+    for tcp, points in sorted(data.items()):
+        xs = sorted(points)
+        for axis, key in ((left, "jain"), (right, "share")):
+            values = [points[x][key] for x in xs]
+            axis.errorbar(xs, [mean(v) if v else float("nan") for v in values],
+                          yerr=[stdev(v) if len(v) > 1 else 0 for v in values],
+                          marker="o", capsize=3, label=f"RUDP vs {tcp}")
+    left.set(title="Jain's fairness index (mean +/- sd)", xlabel="RTT (ms)",
+             ylabel="Jain index (1 = equal share)", ylim=(0.5, 1.02))
+    right.axhline(50, color="k", linestyle=":", linewidth=1, label="equal share")
+    right.set(title="RUDP share of the bottleneck (mean +/- sd)", xlabel="RTT (ms)",
+              ylabel="RUDP share while both run (%)", ylim=(0, 100))
+    for axis in (left, right):
+        axis.grid(alpha=0.3)
+        axis.legend()
     figure.tight_layout()
-    figure.savefig(output / "fairness.png", dpi=160)
+    figure.savefig(output / "fairness_vs_rtt.png", dpi=160)
     plt.close(figure)
 
 
@@ -151,6 +220,7 @@ def main() -> None:
     plot_cwnd(args.results / "logs", args.output)
     plot_rtt(rows, args.output)
     plot_fairness(rows, args.output)
+    plot_fairness_summary(rows, args.output)
 
 
 if __name__ == "__main__":

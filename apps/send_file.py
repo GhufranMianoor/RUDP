@@ -1,6 +1,6 @@
 """Send a file over RUDP.
 
-    python apps/send_file.py HOST PORT FILE [--cc {reno,null}] [--log PATH]
+    python apps/send_file.py HOST PORT FILE [--cc {reno,cubic,null}] [--log PATH]
                              [--summary PATH] [--window N]
 """
 
@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 from rudp.connection import Connection, ConnectionError
 from rudp.constants import DEFAULT_WINDOW
-from rudp.controller import NullController, RenoController
+from rudp.controller import CubicController, NullController, RenoController
 from rudp.eventlog import EventLogger
 
 
@@ -28,7 +28,7 @@ def main() -> int:
     parser.add_argument("host", help="Destination IP or hostname")
     parser.add_argument("port", type=int, help="Destination UDP port")
     parser.add_argument("file", help="File to send")
-    parser.add_argument("--cc", choices=["reno", "null"], default="reno",
+    parser.add_argument("--cc", choices=["reno", "cubic", "null"], default="reno",
                         help="Congestion controller to use (default: reno)")
     parser.add_argument("--log", type=Path, default=None,
                         help="Optional path to output JSON-lines event log")
@@ -46,10 +46,11 @@ def main() -> int:
         data = source.read()
 
     logger = EventLogger(destination=args.log) if args.log else None
-    if args.cc == "reno":
+    if args.cc in ("reno", "cubic"):
         # ssthresh starts at the window cap ("infinite"), so slow start runs
         # until the first loss, as in real TCP.
-        controller = RenoController(
+        cls = RenoController if args.cc == "reno" else CubicController
+        controller = cls(
             initial_cwnd=args.init_cwnd, initial_ssthresh=float(args.window), logger=logger
         )
     else:
