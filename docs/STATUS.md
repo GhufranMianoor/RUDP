@@ -1,20 +1,52 @@
-# Final Week Audit Status
+# Status
 
-Audit performed on `ghufran_final` after the baseline test run (`26 passed`).
+Last updated after the protocol, topology and runner fixes. "Verified" names the
+environment, because the sandbox used for development has no `netem` and no OVS
+kernel module.
 
-| Requirement | Status | Existing evidence / gaps |
-|---|---|---|
-| A. Protocol core | DONE | [`rudp/packet.py`](/workspaces/RUDP/rudp/packet.py), [`rudp/sender.py`](/workspaces/RUDP/rudp/sender.py), [`rudp/receiver.py`](/workspaces/RUDP/rudp/receiver.py), and [`rudp/connection.py`](/workspaces/RUDP/rudp/connection.py) now implement the specified 32-byte header, CRC/SACK, connection IDs, retransmitted handshake, FIN linger, adaptive RTO, effective flow-control windows, zero-window probing, and selective-repeat transfer. [`tools/lossy_proxy.py`](/workspaces/RUDP/tools/lossy_proxy.py) provides loss, duplication, delay, and corruption injection. Empty, baseline, and 10 MB SHA-256 transfer tests pass. |
-| B. Mininet topology | DONE | [`topology/topo.py`](/workspaces/RUDP/topology/topo.py) defines h1/h3 and h2/h4 subnets, R1/R2 forwarding and routes, bidirectional `tc` impairments, root validation, and `--check` diagnostics plus SHA-256 transfer validation. |
-| C. Experiments and measurements | DONE | [`experiments/run_experiments.py`](/workspaces/RUDP/experiments/run_experiments.py) defines the requested loss, RTT, rate, and fairness matrix, defaults to three 10 MiB runs, invokes RUDP and iperf3 Reno/CUBIC, computes Jain fairness, and writes `results/raw.csv`, `results/summary.csv`, `results/logs/`, and `results/pcaps/`. |
-| D. Packet captures and dissector | DONE | [`tools/capture_runs.sh`](/workspaces/RUDP/tools/capture_runs.sh) captures handshake, loss-recovery, window-growth, and teardown runs as pcapng on a router interface; [`tools/rudp_dissector.lua`](/workspaces/RUDP/tools/rudp_dissector.lua) dissects the 32-byte header and SACK blocks on UDP port 9000. |
-| E. Analysis and plots | DONE | [`analysis/plot_results.py`](/workspaces/RUDP/analysis/plot_results.py) generates PNGs for goodput versus loss/RTT/rate, cwnd over time, RTT estimate versus measured RTT, and Jain fairness from CSVs and JSON-lines logs. |
-| F. Reproducibility | DONE | [`scripts/setup_ubuntu.sh`](/workspaces/RUDP/scripts/setup_ubuntu.sh) installs Ubuntu dependencies and creates `.venv`; [`scripts/run_all.sh`](/workspaces/RUDP/scripts/run_all.sh) runs topology validation, experiments, and plots; [`requirements.txt`](/workspaces/RUDP/requirements.txt), [`README.md`](/workspaces/RUDP/README.md), and [`docs/AI_USE_LOG.md`](/workspaces/RUDP/docs/AI_USE_LOG.md) provide the requested reproducibility materials. |
+## Verified (and where)
 
-## Existing Supporting Work
+| Item | Evidence |
+|---|---|
+| Protocol, unit + localhost impairment tests | 72 tests pass: SACK cap and ordering, >3 gaps, SYN / SYN+ACK / FIN / FIN+ACK loss, duplication, reordering, corruption, 20% loss, idle and stall time-outs, zero window, once-per-window Reno response, one response per timeout episode, new loss event during SACK recovery, overlap-window fairness |
+| Protocol under loss | `tools/loss_soak.py`, 10 MiB x 10 runs at 0/2/5% loss through the proxy: 30/30 SHA-256 matches, no hangs, receiver always exits |
+| Topology | Real Mininet 2.3 + Open vSwitch (userspace datapath), real `tbf`: ping h1->h2 and h3->h4, traceroute `10.0.1.1 -> 10.0.2.2 -> 10.0.3.10`, iperf3 TCP 94% of 10 Mbit/s, RUDP h1->h2 across both routers with matching SHA-256 |
+| Experiment runner | Real Mininet, Exp3 + Exp4, 1 run, 2 MiB: fresh network per condition, SHA-checked RUDP, iperf3 Reno/CUBIC, concurrent Exp4, CSV output, tcpdump capture inside R1 |
+| Evidence tool | Four pcapng traces produced inside Mininet; handshake, FIN/FIN+ACK, SACK recovery and retransmissions confirmed in the decoded output |
+| Wireshark dissector | tshark 4.2.2 as a non-root user decodes the generated traces |
+| Version 2.2 additions (no Mininet available) | Buffered event log: logged localhost run 158 Mbit/s vs 176 unlogged (was 34). Exp4 overlap fairness and the queueing-delay column exercised end to end with a mocked network and a fake iperf3. `tools/live_demo.py` exercised with a mocked network (transfer, phase changes, SHA-256, cwnd plot). Flow-control capture settings (window 16, 1% loss) tested on localhost through the lossy proxy. |
 
-- RTT sampling and Karn's algorithm: [`rudp/rtt.py`](/workspaces/RUDP/rudp/rtt.py)
-- Reno and fixed-window controllers: [`rudp/controller.py`](/workspaces/RUDP/rudp/controller.py)
-- JSON-lines event logging: [`rudp/eventlog.py`](/workspaces/RUDP/rudp/eventlog.py)
-- Design notes: [`docs/congestion_controller_design.md`](/workspaces/RUDP/docs/congestion_controller_design.md)
-- Existing tests: [`tests/`](/workspaces/RUDP/tests/)
+## NOT verified yet - must be done on the Ubuntu lab machine
+
+- **`netem` (delay and loss).** The development kernel has no netem, so
+  `tc ... netem delay ... loss ...` has never run. Run `topo.py --check` with
+  `--delay 25ms --loss 2%` and confirm the RTT assertion passes and `tc -s qdisc`
+  shows netem with a tbf child.
+- **Kernel-datapath OVS.** Only the userspace datapath was exercised.
+- **The full matrix**: 3 conditions x 3 runs x 10 MiB for every experiment. Only Exp3/Exp4
+  with 2 MiB and one run were executed, and without delay or loss.
+- **Reproduction on a fresh Ubuntu VM** following only the README.
+- **Wireshark GUI** annotated screenshots (`results/evidence/`), following
+  `docs/SCREENSHOT_CHECKLIST.md`.
+- **`tools/live_demo.py` in real Mininet**, including `tc qdisc change` of netem while
+  tbf stays attached as its child. Rehearse it once before the live demo.
+- **The fifth capture** (`flow-control`) and the Exp4 overlap fairness with real iperf3.
+
+- **Architecture figure**: `docs/figures/architecture.svg/.png` is done and matches the proposal's addressing plan; check it against what you actually demo.
+
+## Still to write (cannot be done before the measurements exist)
+
+- Results and discussion in `REPORT.md` (`python analysis/make_report_tables.py`
+  prints the tables from `results/summary.csv`).
+- Names, roll numbers and the contributions section; make them match who did what.
+- `docs/AI_USE_LOG.md`: add the team's other AI use; the entry for this round of
+  fixes is already written.
+
+## Known limitations
+
+- RTT is sampled from sender-local send times (Karn); the timestamp-echo field is on the
+  wire but not used for sampling. Packets acknowledged cumulatively after a hole fills,
+  and not SACKed earlier, can give inflated samples.
+- Loss is applied per direction, so ACKs are also lost.
+- The 10 MiB Exp4 fairness measure is over each flow's own duration (see README).
+- iperf3 `-n` under-counts TCP by up to ~3% at 10 MiB (see README).

@@ -1,7 +1,8 @@
 # Reliable UDP (RUDP) Technical Report
 
 **Repository:** `GhufranMianoor/RUDP`
-**Report date:** 2026-11-21
+**Report date:** *[fill in on submission]*
+**Team:** *[names and roll numbers]*
 
 ## 1. Objective
 
@@ -17,147 +18,338 @@ The experimental topology uses two Linux routers and four end hosts. The
 left hosts use `10.0.1.0/24`, the router WAN uses `10.0.2.0/24`, and the right
 hosts use `10.0.3.0/24`. Full interface addresses and static routes are listed
 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). RUDP data uses UDP 9000;
-iperf3 uses its own TCP/UDP control/data ports.
+the TCP baseline uses iperf3 on TCP 5201.
+
+![Figure 1: network architecture and addressing plan](docs/figures/architecture.png)
+
+*Figure 1: subnets, addresses, ports, switches, routers, impairment point, capture point and flows.*
 
 Linux IP forwarding and static routes provide end-to-end reachability.
-`tc netem` injects delay and packet loss and a TBF queue creates bottleneck
-bandwidth. The routers therefore act as measurable impairment points rather
-than as switches only.
+`tc netem` injects delay and packet loss on both egress interfaces of the R1-R2
+link (delay is one-way, so RTT = 2 x delay; loss is per direction), and a child
+TBF qdisc creates the bottleneck rate with a 100-packet drop-tail queue. The
+routers therefore act as measurable impairment points rather than as switches only.
+Subnets A and C are shared LANs built from Open vSwitch bridges.
 
 ## 3. RUDP protocol design
 
-Every RUDP datagram begins with a 32-byte, big-endian header:
+### 3.1 Packet format
 
-```text
->BBHIIHHIIIB3x
-```
+RUDP is an application-layer protocol carried in UDP datagrams to port 9000.
+Every datagram starts with a 32-byte, network-order header (Python `struct`
+format `>BBHIIHHIIIB3x`), followed by 0 to 3 SACK blocks of 8 bytes and up to
+1200 bytes of payload. With IPv4 (20 B) and UDP (8 B) headers, a full data
+packet is 1260 bytes, below the 1500-byte Ethernet MTU, so IP never fragments.
 
-It contains version, flags, connection ID, sequence number, cumulative
-acknowledgement, receive window, payload length, timestamp, timestamp echo,
-CRC32, SACK block count, and reserved bytes. Up to three 8-byte inclusive
-SACK ranges follow the fixed header. Payloads are limited to 1200 bytes.
+| Offset | Size | Field | Meaning |
+|---|---|---|---|
+| 0 | 1 B | Version | Always 1; other versions are rejected |
+| 1 | 1 B | Flags | SYN 0x01, ACK 0x02, FIN 0x04, DATA 0x08, RST 0x10 |
+| 2 | 2 B | Connection ID | Random per connection; packets with another ID are ignored |
+| 4 | 4 B | Sequence | Packet number of a DATA packet (first data packet = 1); the FIN carries the next unused number |
+| 8 | 4 B | Acknowledgement | Cumulative: the next packet number the receiver expects |
+| 12 | 2 B | Window | Free receive-buffer slots, in packets (flow control) |
+| 14 | 2 B | Payload length | Bytes of payload; must match the datagram length |
+| 16 | 4 B | Timestamp | Sender clock in ms when this copy was sent |
+| 20 | 4 B | Timestamp echo | Timestamp of the packet that triggered this ACK |
+| 24 | 4 B | CRC32 | Over header (with this field zeroed), SACK blocks and payload |
+| 28 | 1 B | SACK count | Number of SACK blocks that follow (0 to 3) |
+| 29 | 3 B | Reserved | Zero |
+| 32 | 8 B each | SACK blocks | Inclusive `(start, end)` ranges received above the cumulative ACK |
 
-Flags are SYN, ACK, FIN, DATA, and RST. Sequence numbers identify bytes or
-logical packet units; acknowledgements are cumulative. The 32-bit CRC32
-protects the header, SACK blocks, and payload.
+Sequence numbers count packets, not bytes. This keeps the SACK scoreboard and
+the window arithmetic in whole packets, which is also the unit of cwnd. A
+packet that fails the CRC32, has an unknown version, or whose lengths do not
+add up is dropped silently, exactly as if the network had lost it, so
+corruption is handled by the normal loss-recovery path.
 
-## 4. Reliability and congestion control
+### 3.2 Connection set-up and teardown
 
-The sender maintains a sliding window and retransmission queue. It supports
-selective-repeat delivery and effective flow-control windows from receiver
-ACK packets. The connection class retransmits handshake SYN packets, sends
-SYN+ACK responses, validates peer addresses and connection IDs, and has FIN
-linger for teardown.
+1. **Handshake.** The sender sends SYN with a random 16-bit connection ID. The
+   receiver adopts that ID and answers SYN+ACK; the sender completes with ACK
+   and starts sending data. A lost SYN or SYN+ACK is covered by retransmitting
+   the SYN (up to 7 times, waiting 1 s, 2 s, then 4 s). A lost final ACK does
+   no harm, because the first DATA packet also proves the connection is open.
+   The SYN/SYN+ACK round trip, if the SYN was not retransmitted, seeds the RTO
+   estimator (Karn's rule).
+2. **Teardown.** When every data packet is acknowledged, the sender sends FIN
+   carrying the next sequence number. The receiver accepts it only when it has
+   delivered everything before that number (otherwise it re-ACKs and keeps
+   waiting for the missing data), answers FIN+ACK, and lingers 1.5 s, answering
+   any retransmitted FIN, so a lost FIN+ACK cannot strand the sender (a short
+   TIME_WAIT). The FIN is retransmitted up to 8 times.
+3. **Giving up.** A sender with no progress for 30 s and a receiver that hears
+   nothing for 30 s both exit with an error, so no experiment can hang.
 
-The Reno-style controller implements slow start, congestion avoidance,
-duplicate-ACK loss response, timeout loss response, and recovery state.
-SACK-driven acknowledgement processing reports gaps while the receiver tracks
-out-of-order packets and emits a cumulative ACK plus SACK ranges.
+## 4. Reliability, flow control and congestion control
 
-RTT samples use timestamp echo values. Karn's algorithm prevents retransmitted
-packets from producing ambiguous RTT samples. The RTO estimator uses smoothed
-RTT, RTT variation, and bounded minimum/maximum RTO values.
+### 4.1 Selective Repeat with SACK
+
+The sender keeps every transmitted but unacknowledged packet in an
+*outstanding* table. A packet leaves the table when the cumulative ACK passes
+it or a SACK block covers it; SACKed numbers are also kept in a sorted
+*scoreboard*. The receiver buffers out-of-order packets inside its window,
+delivers in order as soon as a hole is filled, and reports up to three SACK
+ranges per ACK, the most recently changed first (as in RFC 2018), so that
+over several ACKs the sender learns about every range even when there are
+more than three holes.
+
+A packet is declared **lost** in one of two ways:
+
+- **Fast retransmit (SACK-based).** At least three packets sent after it have
+  been SACKed. This is the SACK equivalent of TCP's three duplicate ACKs. A
+  retransmission that is itself lost is detected the same way, counting only
+  packets sent after the retransmission.
+- **Retransmission timeout (RTO).** The packet has been outstanding longer than
+  the RTO.
+
+Lost packets stop counting as "in flight" and wait in a queue until the
+congestion window allows them to be sent again, so a timeout does not turn into
+a full-window burst while cwnd is 1. The classic duplicate-ACK counter of RFC
+5681 is implemented too, but because every ACK above a hole carries SACK
+blocks, in practice all fast retransmits come from the scoreboard.
+
+### 4.2 Flow control
+
+Every ACK advertises the number of free slots in the receiver's reorder buffer
+(window size minus buffered out-of-order packets). The sender keeps at most
+min(cwnd, advertised window) packets in flight and never lets the distance
+between the oldest unacknowledged packet and the next new one exceed the
+window. When the advertised window is 0 it sends a single probe packet so a
+window update cannot be lost forever. The default window is 1024 packets
+(1.2 MB), above the largest bandwidth-delay product tested (20 Mbit/s x 200 ms
+= 500 kB), so in the experiments cwnd is the limit. The `flow-control` capture
+uses a 16-packet window to show the advertised window limiting the sender.
+
+### 4.3 Congestion control (Reno, RFC 5681)
+
+| State | On each newly acknowledged packet | On loss |
+|---|---|---|
+| Slow start (cwnd < ssthresh) | cwnd += 1 | see below |
+| Congestion avoidance | cwnd += 1/cwnd (about +1 per RTT) | see below |
+| Fast recovery | cwnd held at ssthresh | a new loss event halves again |
+
+- **Fast retransmit / fast recovery.** On a SACK-detected loss, ssthresh =
+  max(2, cwnd/2) and cwnd = ssthresh. This happens **once per window of data**:
+  further losses among packets sent before the loss was detected belong to the
+  same event. Recovery ends when the cumulative ACK passes the highest packet
+  sent when the event began. A loss among packets sent after that point is a
+  new congestion event and halves cwnd again.
+- **Timeout.** ssthresh = max(2, cwnd/2), cwnd = 1, back to slow start, RTO
+  doubled. All packets that expire within one timeout episode (sent before
+  the first expiry was detected) count as **one** event.
+- **Start.** cwnd = 1 packet and ssthresh = the window cap, so slow start runs
+  until the first loss, as in TCP.
+
+Every change of cwnd, ssthresh or state is written to a JSON-lines event log,
+which produces the cwnd plots. Logging is buffered in memory and written in
+batches, so it does not slow the sender down.
+
+### 4.4 RTT estimation and RTO (RFC 6298)
+
+The sender records the send time of each packet. When a packet that was sent
+exactly once is acknowledged, the elapsed time is an RTT sample (Karn's
+algorithm discards samples from retransmitted packets, whose ACK is
+ambiguous). The estimator follows RFC 6298: SRTT and RTTVAR with gains 1/8
+and 1/4, RTO = SRTT + 4 x RTTVAR, clamped to [0.2 s, 5 s]; the initial RTO is
+1 s. A timeout doubles the RTO until a new valid sample arrives.
+
+### 4.5 Design choices
+
+- **Packet-numbered sequence space.** Simpler SACK and window arithmetic than
+  byte numbering; payloads are fixed at 1200 bytes except the last one.
+- **SACK instead of plain Go-Back-N or ACK-per-packet.** Selective Repeat
+  needs to know which packets arrived; cumulative ACK plus SACK ranges gives
+  that in one small ACK and still works when ACKs are lost.
+- **Once-per-window congestion response.** Without it, a burst of drops at the
+  bottleneck queue (for example at the end of slow start) would cut cwnd
+  repeatedly for what is one congestion signal. During development this was
+  measured directly: counting each expired packet as a separate timeout cut
+  goodput on an emulated 10 Mbit/s, 100 ms path from 7.2 to 3.5 Mbit/s.
+- **Timestamps on the wire.** Each copy, including retransmissions, carries a
+  fresh timestamp and ACKs echo it. RTT is sampled from local send times; the
+  fields make retransmissions and ACK timing easy to read in captures.
 
 ## 5. POC implementation
 
-`apps/recv_file.py` binds UDP 9000 and writes the reassembled file.
-`apps/send_file.py` reads a file, opens a RUDP connection, sends the data,
-and optionally writes a JSON-lines congestion/event log.
-`topology/topo.py` creates the routed Mininet network and validates routes and
-SHA-256 file integrity. `rudp_dissector.lua` exposes RUDP fields in Wireshark.
+| Component | File | Role |
+|---|---|---|
+| Packet codec | `rudp/packet.py` | Header, SACK blocks, CRC32 encode/decode |
+| Sender | `rudp/sender.py` | Outstanding table, SACK scoreboard, loss detection, timers |
+| Receiver | `rudp/receiver.py` | Reorder buffer, cumulative ACK, SACK ranges, advertised window |
+| Congestion control | `rudp/controller.py` | Reno state machine and RTO estimator |
+| RTT sampling | `rudp/rtt.py` | Karn-filtered RTT samples and statistics |
+| Connection | `rudp/connection.py` | Handshake, send loop, FIN/linger, time-outs |
+| Applications | `apps/send_file.py`, `apps/recv_file.py` | File transfer over RUDP; `--progress` prints cwnd live |
+| Topology | `topology/topo.py` | Mininet network, routes, `tc` impairments, `--check` |
+| Live demo | `tools/live_demo.py` | Routes, traceroute, transfer with loss/delay changed mid-run, cwnd plot |
 
-A live POC is demonstrated by:
+The live demonstration is one command:
 
 ```bash
-sudo .venv/bin/python topology/topo.py --delay 25ms --loss 0% --rate 10mbit --check
+sudo .venv/bin/python tools/live_demo.py --pause
 ```
 
-The check prints routes and traceroute output, transfers the README by RUDP,
-and compares the sender and receiver SHA-256 values.
+It prints the interfaces and routing tables of h1, h2, R1 and R2 and the
+bottleneck qdiscs, runs traceroute h1 -> h2 (10.0.1.1 -> 10.0.2.2 ->
+10.0.3.10), then transfers a 30 MiB file while printing cwnd, ssthresh,
+state, RTO and progress every 0.5 s. At 10 s it adds 2% loss and at 20 s it
+raises the RTT from 50 ms to 200 ms, so the audience sees cwnd halve under
+loss and grow more slowly at the longer RTT. It ends with matching SHA-256
+hashes and a cwnd plot with the phase changes marked.
 
 ## 6. Packet capture evidence
 
-Capture RUDP traffic on R1's WAN interface:
-
 ```bash
-sudo tools/capture_runs.sh R1-eth3 results/pcaps 30
+sudo .venv/bin/python tools/capture_evidence.py
 ```
 
-Load [tools/rudp_dissector.lua](tools/rudp_dissector.lua) in Wireshark with
-**Analyze > Lua Plugins**. Recommended evidence is:
+records five traces inside R1 on its LAN-side interface (the sender's side of
+the bottleneck, where originals, retransmissions and returning ACKs are all
+visible):
 
-1. SYN / SYN+ACK / ACK handshake
-2. DATA, ACK, and SACK loss recovery
-3. DATA bursts showing window growth
-4. FIN / ACK teardown
+| Trace | Network | What it shows |
+|---|---|---|
+| `handshake.pcapng` | RTT 50 ms, no loss | SYN, SYN+ACK, ACK and the first DATA packets |
+| `loss-recovery.pcapng` | RTT 100 ms, 2% loss | ACKs with SACK ranges around a hole, then the retransmission |
+| `window-growth.pcapng` | RTT 100 ms, no loss | DATA bursts doubling every RTT (slow start), then linear growth |
+| `teardown.pcapng` | RTT 50 ms, no loss | FIN carrying the next sequence number, FIN+ACK |
+| `flow-control.pcapng` | RTT 100 ms, 1% loss, window 16 | At most 16 DATA packets in flight; the ACK window field shrinking while holes are open |
 
-Annotate screenshots with frame number, source/destination, UDP ports,
-RUDP flags, connection ID, sequence, acknowledgement, window, SACK ranges,
-timestamp fields, and CRC32.
+[tools/rudp_dissector.lua](tools/rudp_dissector.lua) decodes them in
+Wireshark (filter prefix `rudpcn`; Wireshark's built-in "RUDP" is a different
+protocol). Annotated screenshots are in `results/evidence/`; see
+[docs/SCREENSHOT_CHECKLIST.md](docs/SCREENSHOT_CHECKLIST.md) for what each one
+must label.
+
+1. SYN / SYN+ACK / ACK handshake - *[figure]*
+2. DATA, ACK with SACK ranges, and the retransmission - *[figure]*
+3. DATA bursts growing per round trip (slow start) - *[figure]*
+4. FIN / FIN+ACK teardown - *[figure]*
+5. Window-limited sending with a 16-packet receive window - *[figure]*
 
 ## 7. Experimental method
 
-The experiment runner executes RUDP Reno plus TCP Reno and TCP CUBIC for three
-runs under:
+Each condition runs in a freshly built network with a fixed 100-packet
+drop-tail queue at the bottleneck. Every run sends one 10 MiB file
+(deterministic pseudo-random content, SHA-256 checked for RUDP) with RUDP Reno
+(h1 to h2, UDP 9000), then TCP Reno and TCP CUBIC with iperf3 (h3 to h4, TCP
+5201). Three runs per condition; tables report mean and standard deviation.
 
-| Experiment | Condition |
-|---|---|
-| Exp1 | 0%, 2%, 5% loss |
-| Exp2 | 20 ms, 100 ms, 200 ms RTT |
-| Exp3 | 5 Mbps, 10 Mbps, 20 Mbps bottleneck |
-| Exp4 | 10 Mbps fairness condition |
+| Experiment | Condition (others: RTT 100 ms, 10 Mbit/s, 0% loss) | Metrics |
+|---|---|---|
+| Exp1 | 0%, 2%, 5% loss per direction | Goodput, retransmissions, completion time |
+| Exp2 | 20 ms, 100 ms, 200 ms RTT | Goodput, RUDP RTT estimate vs configured RTT |
+| Exp3 | 5, 10, 20 Mbit/s bottleneck | Goodput, cwnd over time, RTT estimate above minimum RTT (queueing delay) |
+| Exp4 | RUDP and TCP Reno **concurrently** on 10 Mbit/s | Per-flow throughput, Jain's fairness index |
 
-Measured metrics include completion time, goodput, retransmission count,
-estimated RTT, payload SHA-256, and Jain's fairness index. The 10 MiB payload
-is deterministic and hashed for integrity.
+The comparison with TCP Reno and CUBIC (proposal experiment 4) is part of
+every Exp1 to Exp3 condition; the fairness test (proposal experiment 5) is
+Exp4 here.
 
-The complete matrix runs with:
+**Metrics.** RUDP goodput is payload bytes divided by the time from the end of
+the handshake to the acknowledged FIN. TCP goodput is iperf3's receiver-side
+`sum_received`; iperf3 `-n` ends when the sender has written the last byte, so
+up to about 0.3 MB still queued at the bottleneck is not counted, which
+under-counts TCP by at most about 3% at 10 MiB. Also recorded: completion time,
+retransmissions (RUDP retransmitted packets; TCP `retransmits` from iperf3),
+and RUDP smoothed and minimum RTT. Failed transfers are kept in `raw.csv` and
+excluded from means. Every RUDP run writes an event log.
 
-```bash
-sudo scripts/run_all.sh
-```
+**Fairness.** Both flows start together and send 10 MiB each. Throughput is
+measured for both over the **same window**, from when both are delivering to
+when the first one finishes: for RUDP from the acknowledgement times in its
+event log, for TCP from the iperf3 receiver's 0.5 s intervals. Jain's index is
+J = (x1 + x2)^2 / (2 (x1^2 + x2^2)), 1 for an equal split and 0.5 when one
+flow takes everything. Measuring each flow over its own duration instead
+would over-state fairness, because the flow that finishes second has the link
+to itself at the end; that value is kept in `raw.csv` as
+`fairness_index_own_duration` for comparison only.
 
-`results/raw.csv` contains each run; `results/summary.csv` contains per-condition
-means and standard deviations/ranges. The plot script produces goodput,
-congestion-window, RTT, and fairness graphs.
+The complete matrix runs with `sudo scripts/run_all.sh`. `results/raw.csv` has
+one row per transfer and `results/summary.csv` the mean and standard deviation
+per condition.
 
-## 8. Reproduction procedure
+## 8. Results
+
+> **NOT YET MEASURED.** This section must be filled from `results/summary.csv`
+> after running the matrix on the lab machine (`python analysis/make_report_tables.py
+> --results results` prints the tables). Do not write numbers that are not in
+> `summary.csv`.
+
+*[Table and figure for Exp1: goodput versus loss]*
+*[Table and figure for Exp2: goodput versus RTT, and RTT estimate versus configured RTT]*
+*[Table and figure for Exp3: goodput versus bottleneck rate]*
+*[Table for Exp4: shares of the bottleneck and Jain's index]*
+*[Figure: cwnd and ssthresh over time showing slow start, the sawtooth, and any timeout]*
+
+### 8.1 Discussion
+
+*[To write from the measured data: how goodput falls with loss and why (Reno's
+response to loss, ACK loss because loss is per direction); behaviour at long RTT;
+whether RUDP approaches the bottleneck rate at 0% loss; how the RTT estimate compares
+with the configured RTT plus queueing (the 100-packet queue adds up to 240 ms at
+5 Mbit/s); how RUDP and TCP Reno share the link and whether the fairness index
+supports "TCP-friendly".]*
+
+## 9. Reproduction procedure
 
 ```bash
 git clone https://github.com/GhufranMianoor/RUDP.git
 cd RUDP
 sudo scripts/setup_ubuntu.sh
-source .venv/bin/activate
-python -m pytest -q
+.venv/bin/python -m pytest -q
 sudo scripts/run_all.sh
 ```
 
-For a dependency-free matrix schema check:
+## 10. Validation and limitations
 
-```bash
-python experiments/run_experiments.py --dry-run --runs 3 --results /tmp/rudp-results
-python analysis/plot_results.py --results /tmp/rudp-results --output /tmp/rudp-plots
-```
+**Tests.** 72 automated tests (`tests/`) cover packet encoding and corruption,
+the sender scoreboard and receiver state, RTT and Karn's rule, Reno
+transitions including one response per loss event and per timeout episode,
+the overlap-window fairness calculation, and localhost transfers through an
+impairment proxy with loss, duplication, reordering, corruption, and loss of
+SYN, SYN+ACK, FIN and FIN+ACK. A 10 MiB x 10-run soak at 0%, 2% and 5% loss
+passed all SHA-256 checks.
 
-## 9. Validation and limitations
+**Limitations.**
 
-The unit tests cover packet encoding/decoding, sender and receiver state,
-RTT, congestion-control transitions, and transfer behavior. Mininet, Linux
-`tc`, dumpcap, and iperf3 require a root Ubuntu environment and may not work
-inside ordinary containers or CI runners.
+- Loss is applied in both directions, so ACKs are lost as well as data.
+- RTT is sampled from local send times, not from the timestamp echo. Packets
+  acknowledged cumulatively after a hole fills, and not SACKed before, can give
+  samples that include the recovery time.
+- iperf3 `-n` under-counts TCP slightly (Section 7).
+- The fairness window is aligned to the iperf3 client's launch time, so it can
+  be early by about one connection set-up time; this is small against a
+  multi-second window.
+- RUDP runs in user-space Python. On the test machine it reached well above
+  20 Mbit/s on localhost, so the bottleneck, not the CPU, limits throughput in
+  these experiments; it would not keep up with gigabit links.
+- Mininet, `tc`, dumpcap and iperf3 need a root Ubuntu environment.
 
-Packet loss and RTT experiments require the routed Mininet topology; changing
-conditions while a transfer is active may invalidate that run. For repeatable
-measurements, run each condition from a fresh topology and keep CPU load
-constant.
+## 11. Individual contributions
 
-## 10. Deliverables
+| Member | Roll no. | What this person did |
+|---|---|---|
+| *[name]* | *[no.]* | *[specific components, tests, experiments, report sections]* |
+| *[name]* | *[no.]* | *[...]* |
+
+*[Fill in with what each person actually did; it must match the repository history.]*
+
+## 12. Use of AI tools
+
+*[Complete with the team's own disclosure.]* Record of AI assistance used in the
+repository: see [docs/AI_USE_LOG.md](docs/AI_USE_LOG.md). All AI-generated code and
+text must be understood, tested and reviewed by the team before submission.
+
+## 13. Deliverables
 
 - Source POC: `rudp/`, `apps/`
 - Topology: `topology/topo.py`
-- Experiments: `experiments/run_experiments.py`
-- Capture scripts: `tools/capture_runs.sh`
-- Wireshark dissector: `tools/rudp_dissector.lua`
+- Experiments: `experiments/run_experiments.py`; analysis: `analysis/`
+- Captures: `tools/capture_evidence.py`; dissector: `tools/rudp_dissector.lua`
+- Live demo: `tools/live_demo.py`; screenshot guide: `docs/SCREENSHOT_CHECKLIST.md`
+- Localhost stress tools: `tools/lossy_proxy.py`, `tools/loss_soak.py`
 - Reproducibility: `README.md`, `scripts/setup_ubuntu.sh`, `scripts/run_all.sh`
 - Architecture: `docs/ARCHITECTURE.md`
 - Test suite: `tests/`

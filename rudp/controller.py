@@ -19,7 +19,7 @@ from enum import Enum
 import time
 from typing import Any, Callable, Protocol, runtime_checkable
 
-from .constants import DEFAULT_RTO, DEFAULT_WINDOW
+from .constants import DEFAULT_RTO, DEFAULT_WINDOW, MAX_RTO, MIN_RTO
 from .eventlog import EventLogger
 
 
@@ -118,6 +118,10 @@ class BaseController(ABC):
             self._srtt = 0.875 * self._srtt + 0.125 * rtt
         self._timeout = min(maximum, max(minimum, self._srtt + max(0.001, 4 * self._rttvar)))
 
+    def observe_rtt(self, rtt: float) -> None:
+        """Seed the RTO estimator with a sample that must not move cwnd (handshake RTT)."""
+        self._update_rto(rtt, MIN_RTO, MAX_RTO)
+
     @abstractmethod
     def window(self) -> int:
         """Return the current sending window in packets."""
@@ -135,8 +139,21 @@ class BaseController(ABC):
 
     @abstractmethod
     def on_loss(self, sequence: int) -> None:
-        """Process a packet loss event."""
+        """Process a retransmission-timeout loss event."""
         raise NotImplementedError
+
+    def on_fast_retransmit(self, sequence: int) -> None:
+        """Observe a fast retransmission without applying RTO backoff.
+
+        Reno's congestion response is already performed when the third
+        duplicate ACK enters Fast Recovery. Other controllers may override
+        this hook if they need separate fast-loss accounting.
+        """
+        del sequence
+
+
+    def on_recovery_complete(self) -> None:
+        """Called by the sender when the cumulative ACK passes a loss event."""
 
 
 class NullController(BaseController):
@@ -180,7 +197,7 @@ class NullController(BaseController):
 
     def on_ack(self, sequence: int, rtt: float | None = None) -> None:
         del sequence
-        self._update_rto(rtt, 0.05, 5.0)
+        self._update_rto(rtt, MIN_RTO, MAX_RTO)
 
     def on_duplicate_ack(self, ack_number: int) -> bool:
         del ack_number
@@ -189,8 +206,11 @@ class NullController(BaseController):
     def on_loss(self, sequence: int) -> None:
         del sequence
 
+    def on_fast_retransmit(self, sequence: int) -> None:
+        del sequence
+
     def on_rto_timeout(self) -> None:
-        self._timeout = min(5.0, self._timeout * 2)
+        self._timeout = min(MAX_RTO, self._timeout * 2)
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -248,6 +268,10 @@ class RenoController(BaseController):
         self._dup_acks: int = 0
         self._last_ack_number: int | None = None
         self._fast_recovery_seq: int | None = None
+        # True when the sender (SACK scoreboard) owns recovery exit via
+        # on_recovery_complete(); False for the classic dup-ACK path, which
+        # exits on the first ACK of new data.
+        self._managed_recovery: bool = False
         self._history: list[dict[str, Any]] = []
 
         self._log_state_change("init")
@@ -292,7 +316,11 @@ class RenoController(BaseController):
         """
         # A fresh ACK resets the consecutive duplicate ACK counter
         self._dup_acks = 0
-        self._update_rto(rtt, 0.05, 5.0)
+        self._update_rto(rtt, MIN_RTO, MAX_RTO)
+
+        if self._state == CongestionState.FAST_RECOVERY and self._managed_recovery:
+            # SACK recovery: cwnd stays at ssthresh until the loss event ends.
+            return
 
         if self._state == CongestionState.FAST_RECOVERY:
             # Deflate window back to ssthresh and enter congestion avoidance (RFC 5681 3.2)
@@ -329,6 +357,7 @@ class RenoController(BaseController):
             self._ssthresh = max(2.0, self._cwnd / 2.0)
             self._cwnd = self._ssthresh + float(self.DUP_ACK_THRESHOLD)
             self._state = CongestionState.FAST_RECOVERY
+            self._managed_recovery = False
             self._fast_recovery_seq = ack_number
             self._log_state_change("enter_fast_recovery", ack=ack_number)
             return True
@@ -341,8 +370,34 @@ class RenoController(BaseController):
         return False
 
     def on_loss(self, sequence: int) -> None:
-        """Process a packet loss event (e.g. timeout retransmission)."""
+        """Process a retransmission-timeout loss event."""
+        del sequence
         self.on_rto_timeout()
+
+    def on_fast_retransmit(self, sequence: int) -> None:
+        """A SACK scoreboard declared ``sequence`` lost: halve the window once.
+
+        The sender calls this once per window of data (not once per lost
+        packet) and never collapses cwnd to 1 or backs off the RTO; that is
+        reserved for retransmission timeouts. If the classic duplicate-ACK
+        path already entered Fast Recovery this is a no-op.
+        """
+        if self._state == CongestionState.FAST_RECOVERY and not self._managed_recovery:
+            return
+        self._ssthresh = max(2.0, self._cwnd / 2.0)
+        self._cwnd = self._ssthresh
+        self._dup_acks = 0
+        self._state = CongestionState.FAST_RECOVERY
+        self._managed_recovery = True
+        self._log_state_change("enter_fast_recovery", sequence=sequence, source="sack")
+
+    def on_recovery_complete(self) -> None:
+        """The cumulative ACK has passed the loss event: leave Fast Recovery."""
+        if self._state == CongestionState.FAST_RECOVERY and self._managed_recovery:
+            self._cwnd = self._ssthresh
+            self._state = CongestionState.CONGESTION_AVOIDANCE
+            self._managed_recovery = False
+            self._log_state_change("exit_fast_recovery", source="sack")
 
     def on_rto_timeout(self) -> None:
         """Handle retransmission timeout: severe congestion signal.
@@ -356,7 +411,8 @@ class RenoController(BaseController):
         self._cwnd = self._min_cwnd
         self._dup_acks = 0
         self._state = CongestionState.SLOW_START
-        self._timeout = min(5.0, self._timeout * 2)
+        self._managed_recovery = False
+        self._timeout = min(MAX_RTO, self._timeout * 2)
         self._log_state_change("timeout_loss")
 
     def _log_state_change(self, trigger: str, **extra: Any) -> None:

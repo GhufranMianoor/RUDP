@@ -210,3 +210,47 @@ This telemetry feeds directly into Member 3's analysis scripts and Member 2's We
 - **Week 5: CWND and RTT Results Analysis**:
   - Plotting cwnd over time, queue delay analysis, technical report contribution.
 
+
+## 8. Loss detection and recovery as implemented (final)
+
+The sender (`rudp/sender.py`) drives the controller; the controller never
+inspects packets. The behaviour below supersedes the pure duplicate-ACK
+description in section 4.2 wherever they differ.
+
+**SACK scoreboard.** Packets covered by a cumulative ACK or a SACK block leave
+the outstanding set; SACKed sequence numbers are remembered. An outstanding
+packet is declared *lost* when three packets above it have been SACKed
+(`DUP_ACK_THRESHOLD`). A retransmitted packet is re-declared lost only when
+three packets sent *after* its retransmission were SACKed first, so a single
+loss does not trigger an endless retransmission loop. A SACK-free ACK that
+repeats the cumulative ACK still counts as a classic duplicate ACK.
+
+**One congestion response per window.** `Sender._recovery_point` is
+`next_sequence` at the moment a loss event is reported. Losses of packets sent
+before that point belong to the same event and do not reduce the window again.
+`RenoController.on_fast_retransmit()` sets `ssthresh = max(2, cwnd/2)`,
+`cwnd = ssthresh` and enters Fast Recovery; it does **not** collapse cwnd to 1
+or back off the RTO. When the cumulative ACK passes `_recovery_point` the sender
+calls `on_recovery_complete()` and Reno returns to Congestion Avoidance.
+
+**Timeouts.** One RTO episode (all packets whose timer expired together) calls
+`on_loss()` once: `ssthresh = max(2, cwnd/2)`, `cwnd = 1`, RTO doubled
+(bounded by `MAX_RTO`). Lost packets are not "in flight"; they wait in a queue
+and are retransmitted only as the window allows, so a timeout while cwnd = 1
+sends one packet, not the whole window.
+
+**Timing.** Initial RTO 1 s (RFC 6298), seeded by the handshake RTT, then
+`srtt + 4 * rttvar` clamped to [`MIN_RTO` 0.2 s, `MAX_RTO` 5 s]. The sender waits
+on the socket only until the next timer could fire. RTT samples come from
+sender-local send times with Karn's algorithm (retransmitted packets are never
+sampled). The `timestamp` field of every transmission, including
+retransmissions, is freshly stamped and echoed in `timestamp_echo`; the echo is
+carried for packet-capture analysis and is not what the sender uses to sample RTT.
+
+**Window.** The receive window / maximum sequence span is 1024 packets, above
+the largest bandwidth-delay product tested (20 Mbit/s x 200 ms is about 420
+packets), so cwnd rather than the flow-control window limits throughput. The
+initial `ssthresh` equals the window cap, so slow start runs until the first loss.
+
+**SACK ordering.** The receiver reports the three most recently updated
+out-of-order ranges, newest first (RFC 2018), as inclusive `(start, end)` pairs.

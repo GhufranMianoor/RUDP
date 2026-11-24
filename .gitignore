@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Experiment scratch output (raw.csv, summary.csv, logs, pcaps and plots ARE kept)
+results/work/
+*.received

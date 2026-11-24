@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Run the RUDP/TCP comparison matrix and write reproducible CSV results."""
+"""Run the RUDP vs TCP experiment matrix inside the Mininet topology.
+
+Must run as root on the Ubuntu lab machine (``sudo .venv/bin/python
+experiments/run_experiments.py``). For every condition it builds a fresh
+network with ``topology/topo.py`` (delay / loss / rate on the R1-R2 link),
+then for each run:
+
+* RUDP     h1 -> h2, UDP 9000, verified by SHA-256
+* TCP Reno h3 -> h4, iperf3 on TCP 5201 (``-C reno``)
+* TCP CUBIC h3 -> h4, iperf3 on TCP 5201 (``-C cubic``)
+
+The fairness experiment (Exp4) instead runs RUDP (h1 -> h2) and iperf3
+(h3 -> h4) *at the same time* over the shared bottleneck.
+
+Goodput is application bytes divided by the transfer time: for RUDP the
+sender-measured time from the end of the handshake to the FIN being
+acknowledged; for TCP, iperf3's ``sum_received`` (bytes and seconds seen by
+the receiver). Packet captures are taken inside R1 on its sender-side (LAN)
+interface for the first run of each condition; RUDP event logs for every run.
+Exp4 fairness uses both flows' throughput over the window in which both are
+running (``experiments/fairness.py``), not each flow over its own duration.
+"""
 
 from __future__ import annotations
 
@@ -7,248 +28,434 @@ import argparse
 import csv
 import hashlib
 import json
-import math
-import os
-from pathlib import Path
-import shlex
+import random
 import shutil
 import statistics
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS = ROOT / "results"
-PAYLOAD_SIZE = 10 * 1024 * 1024
+sys.path.insert(0, str(ROOT / "topology"))
+sys.path.insert(0, str(ROOT / "experiments"))
+sys.path.insert(0, str(ROOT))
+
+from fairness import (  # noqa: E402  (experiments/fairness.py)
+    iperf_delivery_curve,
+    jains_fairness,
+    overlap_throughputs,
+    rudp_delivery_curve,
+)
+
+RUDP_PORT = 9000
+IPERF_PORT = 5201
+H1, H2, H3, H4 = "h1", "h2", "h3", "h4"
+DST_RUDP, DST_TCP = "10.0.3.10", "10.0.3.11"
+MIB = 1024 * 1024
 
 
 @dataclass(frozen=True)
 class Condition:
     experiment: str
     name: str
-    delay_ms: float
-    loss_pct: float
+    delay_ms: float  # one-way, on each bottleneck egress: RTT = 2 x delay
+    loss_pct: float  # per direction
     rate_mbps: float
+    concurrent: bool = False
+
+    @property
+    def rtt_ms(self) -> float:
+        return 2 * self.delay_ms
 
 
 def conditions() -> list[Condition]:
     return [
-        *(Condition("Exp1", f"loss_{loss:g}", 50, loss, 10)
-          for loss in (0, 2, 5)),
-        *(Condition("Exp2", f"rtt_{rtt:g}ms", rtt / 2, 0, 10)
-          for rtt in (20, 100, 200)),
-        *(Condition("Exp3", f"rate_{rate:g}mbps", 50, 0, rate)
-          for rate in (5, 10, 20)),
-        Condition("Exp4", "fairness", 50, 0, 10),
+        *(Condition("Exp1", f"loss_{loss:g}", 50, loss, 10) for loss in (0, 2, 5)),
+        *(Condition("Exp2", f"rtt_{rtt:g}ms", rtt / 2, 0, 10) for rtt in (20, 100, 200)),
+        *(Condition("Exp3", f"rate_{rate:g}mbps", 50, 0, rate) for rate in (5, 10, 20)),
+        Condition("Exp4", "fairness", 50, 0, 10, concurrent=True),
     ]
 
 
-def ensure_payload(path: Path) -> str:
-    if not path.exists() or path.stat().st_size != PAYLOAD_SIZE:
-        pattern = bytes(range(256))
-        repetitions, remainder = divmod(PAYLOAD_SIZE, len(pattern))
-        path.write_bytes(pattern * repetitions + pattern[:remainder])
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def ensure_payload(path: Path, size: int) -> str:
+    """Deterministic pseudo-random payload (reordering/corruption cannot hide in a repeating pattern)."""
+
+    if not path.exists() or path.stat().st_size != size:
+        path.write_bytes(random.Random(20260101).randbytes(size))
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def parse_event_log(path: Path) -> tuple[int, float | None]:
-    retransmissions = 0
-    rtts: list[float] = []
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("event") == "retx":
-                retransmissions += 1
-            if isinstance(event.get("rtt"), (int, float)):
-                rtts.append(float(event["rtt"]))
-    return retransmissions, statistics.mean(rtts) if rtts else None
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def run_rudp(condition: Condition, payload: Path, output: Path, host: str, port: int,
-             dry_run: bool) -> dict[str, object]:
-    log = output / "logs" / f"{condition.experiment}_{condition.name}_rudp.jsonl"
-    received = output / f"{condition.experiment}_{condition.name}_received.bin"
-    pcap = output / "pcaps" / f"{condition.experiment}_{condition.name}_rudp.pcapng"
-    receiver = [sys.executable, str(ROOT / "apps/recv_file.py"), str(port), str(received)]
-    sender = [
-        sys.executable, str(ROOT / "apps/send_file.py"), host, str(port), str(payload),
-        "--cc", "reno", "--log", str(log),
-    ]
-    started = time.monotonic()
-    capture = None
-    if not dry_run:
-        interface = "any"
-        dumpcap = shutil.which("dumpcap")
-        if dumpcap:
-            capture = subprocess.Popen(
-                [dumpcap, "-q", "-i", interface, "-f", f"udp port {port}",
-                 "-w", str(pcap)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        with subprocess.Popen(receiver, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
-            subprocess.run(sender, cwd=ROOT, check=True, timeout=300)
-        if capture is not None:
-            capture.terminate()
-            capture.wait(timeout=10)
-    elapsed = time.monotonic() - started
-    if dry_run:
-        elapsed = 0.1
-    retransmissions, rtt = parse_event_log(log)
-    goodput = PAYLOAD_SIZE * 8 / elapsed / 1_000_000 if elapsed else 0.0
-    return {
-        "protocol": "RUDP",
-        "pcap": str(pcap),
-        "completion_time_s": elapsed,
-        "goodput_mbps": goodput,
-        "retransmissions": retransmissions,
-        "rtt_estimate_s": rtt,
-        "command": shlex.join(sender),
+# --------------------------------------------------------------------- helpers
+
+def start_capture(net, pcap: Path):
+    """Capture UDP 9000 on R1's LAN-side interface, inside R1's namespace.
+
+    That is the sender's side of the bottleneck: every transmission (including
+    the originals of packets the bottleneck later drops, and every
+    retransmission) is visible, plus all returning ACKs and SACK blocks.
+    """
+
+    interface = net.interface_names["R1_lan"]
+    pcap.parent.mkdir(parents=True, exist_ok=True)
+    dumpcap = shutil.which("dumpcap")
+    if dumpcap:
+        command = [dumpcap, "-q", "-i", interface, "-f", f"udp port {RUDP_PORT}",
+                   "-s", "256", "-w", str(pcap)]
+    elif shutil.which("tcpdump"):
+        pcap = pcap.with_suffix(".pcap")
+        command = ["tcpdump", "-i", interface, "-s", "256", "-U", "-w", str(pcap),
+                   f"udp port {RUDP_PORT}"]
+    else:
+        return None
+    process = net["R1"].popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(1.0)  # let the capture attach before traffic starts
+    return process
+
+
+def stop_capture(process) -> None:
+    if process is None:
+        return
+    time.sleep(0.5)  # let the last packets reach the capture
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def start_rudp(net, payload: Path, work: Path, tag: str, window: int, log: Path | None):
+    """Start receiver on h2 and sender on h1. Returns handles; sender not yet waited on."""
+
+    received = work / f"{tag}_received.bin"
+    summary = work / f"{tag}_summary.json"
+    received.unlink(missing_ok=True)
+    summary.unlink(missing_ok=True)
+    receiver = net[H2].popen(
+        [sys.executable, str(ROOT / "apps/recv_file.py"), str(RUDP_PORT), str(received),
+         "--idle-timeout", "60"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    time.sleep(0.5)
+    command = [sys.executable, str(ROOT / "apps/send_file.py"), DST_RUDP, str(RUDP_PORT),
+               str(payload), "--cc", "reno", "--summary", str(summary), "--window", str(window)]
+    if log is not None:
+        command += ["--log", str(log)]
+    sender = net[H1].popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    return {"receiver": receiver, "sender": sender, "received": received, "summary": summary,
+            "command": " ".join(command), "started": time.monotonic()}
+
+
+def finish_rudp(handle: dict, payload_sha: str, timeout: float) -> dict:
+    sender, receiver = handle["sender"], handle["receiver"]
+    row: dict[str, object] = {"protocol": "RUDP", "command": handle["command"], "ok": False}
+    try:
+        sender.wait(timeout=timeout)
+        receiver.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        row["error"] = "timeout"
+        return _kill(row, sender, receiver)
+    if handle["summary"].exists():
+        summary = json.loads(handle["summary"].read_text())
+        sha_ok = handle["received"].exists() and sha256_file(handle["received"]) == payload_sha
+        ok = bool(summary.get("ok")) and sha_ok and receiver.returncode == 0
+        row.update(
+            ok=ok,
+            sha256_ok=sha_ok,
+            error=summary.get("error", "") or ("" if ok else "sha256 mismatch or receiver error"),
+            completion_time_s=summary["seconds"],
+            goodput_mbps=summary["goodput_mbps"] if ok else 0.0,
+            retransmissions=summary.get("retransmissions", ""),
+            fast_retransmits=summary.get("fast_retransmits", ""),
+            timeouts=summary.get("timeouts", ""),
+            rtt_estimate_s=summary.get("srtt") or "",
+            min_rtt_s=summary.get("min_rtt") or "",
+            rtt_samples=summary.get("samples", ""),
+            # Smoothed RTT above the path minimum: mostly bottleneck queueing delay.
+            queue_delay_ms=((summary["srtt"] - summary["min_rtt"]) * 1000
+                            if summary.get("srtt") and summary.get("min_rtt") else ""),
+        )
+    else:
+        row["error"] = "sender produced no summary"
+    handle["received"].unlink(missing_ok=True)  # 10 MiB each; the SHA is what we keep
+    return row
+
+
+def _kill(row: dict, *processes) -> dict:
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
+    return row
+
+
+def start_iperf_server(net, keep_output: bool = False):
+    """iperf3 server on h4; returns once it is actually listening.
+
+    With ``keep_output`` the server's JSON (receiver-side 0.5 s intervals) is
+    kept, which Exp4 uses to measure TCP over the overlap window.
+    """
+
+    server = net[H4].popen(
+        ["iperf3", "-s", "-1", "-p", str(IPERF_PORT), "-J", "-i", "0.5"],
+        stdout=subprocess.PIPE if keep_output else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, text=True,
+    )
+    for _ in range(50):
+        if "LISTEN" in net[H4].cmd(f"ss -ltn 'sport = :{IPERF_PORT}'"):
+            return server
+        time.sleep(0.1)
+    server.kill()
+    raise RuntimeError("iperf3 server did not start listening on h4")
+
+
+def start_iperf_client(net, server, algorithm: str, nbytes: int) -> dict:
+    command = ["iperf3", "-c", DST_TCP, "-p", str(IPERF_PORT), "-C", algorithm,
+               "-n", str(nbytes), "-J"]
+    client = net[H3].popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return {"server": server, "client": client, "command": " ".join(command),
+            "algorithm": algorithm, "nbytes": nbytes, "started": time.monotonic()}
+
+
+def finish_iperf(handle: dict, timeout: float) -> dict:
+    client, server = handle["client"], handle["server"]
+    row: dict[str, object] = {
+        "protocol": f"TCP-{handle['algorithm'].upper()}",
+        "command": handle["command"], "ok": False,
     }
+    try:
+        out, err = client.communicate(timeout=timeout)
+        if server.stdout is not None:
+            handle["server_output"], _ = server.communicate(timeout=30)
+        else:
+            server.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        row["error"] = "timeout"
+        return _kill(row, client, server)
+    try:
+        end = json.loads(out)["end"]
+        received, sent = end["sum_received"], end["sum_sent"]
+        # iperf3 -n ends the test when the sender has written all bytes; data
+        # still queued at the bottleneck is not yet in sum_received (about
+        # queue + BDP, ~0.3 MB), so a 95% threshold is used. With >= 10 MiB
+        # payloads that under-counts TCP goodput by <= ~3%.
+        row.update(
+            ok=sent["bytes"] >= handle["nbytes"] and received["bytes"] >= handle["nbytes"] * 0.95,
+            goodput_mbps=received["bits_per_second"] / 1e6,   # receiver side, not sum_sent
+            completion_time_s=received["seconds"],
+            retransmissions=sent.get("retransmits", ""),
+            bytes_received=received["bytes"],
+            bytes_sent=sent["bytes"],
+            rtt_estimate_s="",
+        )
+        if not row["ok"]:
+            row["error"] = f"only {received['bytes']} of {handle['nbytes']} bytes received"
+    except (KeyError, ValueError, json.JSONDecodeError):
+        row["error"] = (err or out or "no iperf3 output").strip()[:200]
+    return row
 
 
-def run_tcp(condition: Condition, payload: Path, output: Path, host: str, port: int,
-            algorithm: str, dry_run: bool) -> dict[str, object]:
-    if shutil.which("iperf3") is None and not dry_run:
-        raise RuntimeError("iperf3 is required for TCP experiments")
-    server = ["iperf3", "-s", "-1", "-p", str(port), "-J"]
-    client = [
-        "iperf3", "-c", host, "-p", str(port), "-C", algorithm,
-        "-n", str(PAYLOAD_SIZE), "-J",
-    ]
-    started = time.monotonic()
-    output_json = ""
-    if not dry_run:
-        with subprocess.Popen(server, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
-            result = subprocess.run(client, cwd=ROOT, check=True, capture_output=True, text=True, timeout=300)
-            output_json = result.stdout
-    elapsed = time.monotonic() - started
-    if dry_run:
-        elapsed = 0.1
-    goodput = PAYLOAD_SIZE * 8 / elapsed / 1_000_000 if elapsed else 0.0
-    if output_json:
-        try:
-            end = json.loads(output_json)["end"]["sum_sent"]
-            goodput = float(end.get("bits_per_second", goodput * 1_000_000)) / 1_000_000
-            elapsed = float(end.get("seconds", elapsed))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            pass
-    return {
-        "protocol": f"TCP-{algorithm.upper()}",
-        "completion_time_s": elapsed,
-        "goodput_mbps": goodput,
-        "retransmissions": "",
-        "rtt_estimate_s": "",
-        "command": shlex.join(client),
-    }
+# ------------------------------------------------------------------------ main
 
+def run_condition(cond: Condition, args, payload: Path, payload_sha: str, work: Path) -> list[dict]:
+    import topo  # topology/topo.py (needs Mininet; imported lazily so --list works anywhere)
 
-def jains_fairness(values: list[float]) -> float:
-    if not values or not any(values):
-        return 0.0
-    return sum(values) ** 2 / (len(values) * sum(value * value for value in values))
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--base-port", type=int, default=19000)
-    parser.add_argument("--results", type=Path, default=DEFAULT_RESULTS)
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-    if args.runs < 1:
-        parser.error("--runs must be positive")
-
-    output = args.results.resolve()
-    (output / "logs").mkdir(parents=True, exist_ok=True)
-    (output / "pcaps").mkdir(parents=True, exist_ok=True)
-    payload = output / "payload-10MiB.bin"
-    payload_hash = ensure_payload(payload)
-    raw: list[dict[str, object]] = []
-    for condition in conditions():
+    print(f"\n=== {cond.experiment} {cond.name}: RTT {cond.rtt_ms:g} ms, "
+          f"loss {cond.loss_pct:g}%/direction, rate {cond.rate_mbps:g} Mbit/s ===", flush=True)
+    net = topo.build_network(f"{cond.delay_ms:g}ms", f"{cond.loss_pct:g}%",
+                             f"{cond.rate_mbps:g}mbit", args.queue_packets)
+    rows: list[dict] = []
+    try:
         for run in range(1, args.runs + 1):
-            port = args.base_port + len(raw)
+            first = run <= args.capture_runs
+            stem = f"{cond.experiment}_{cond.name}_run{run}"
             base = {
-                "experiment": condition.experiment,
-                "condition": condition.name,
-                "run": run,
-                "delay_ms": condition.delay_ms,
-                "loss_pct": condition.loss_pct,
-                "rate_mbps": condition.rate_mbps,
-                "payload_sha256": payload_hash,
-                "pcap": str(output / "pcaps" / f"{condition.experiment}_{condition.name}_{run}.pcapng"),
+                "experiment": cond.experiment, "condition": cond.name, "run": run,
+                "delay_ms": cond.delay_ms, "rtt_ms": cond.rtt_ms, "loss_pct": cond.loss_pct,
+                "rate_mbps": cond.rate_mbps, "payload_bytes": payload.stat().st_size,
+                "payload_sha256": payload_sha, "bottleneck_queue_packets": args.queue_packets,
+                "concurrent": cond.concurrent,
             }
-            for result in (
-                run_rudp(condition, payload, output, args.host, port, args.dry_run),
-                run_tcp(condition, payload, output, args.host, port + 1, "reno", args.dry_run),
-                run_tcp(condition, payload, output, args.host, port + 2, "cubic", args.dry_run),
-            ):
-                raw.append({**base, **result})
-            if condition.experiment == "Exp4":
-                fairness = jains_fairness([
-                    float(raw[-3]["goodput_mbps"]),
-                    float(raw[-2]["goodput_mbps"]),
-                ])
-                raw[-3]["fairness_index"] = fairness
+            # Every run is logged (logging is buffered and does not slow the
+            # sender), so logged and unlogged runs are measured alike.
+            log = args.results / "logs" / f"{stem}_rudp.jsonl"
+            log.unlink(missing_ok=True)
+            pcap = args.results / "pcaps" / f"{stem}.pcapng"
+            results: list[dict] = []
+            if cond.concurrent:
+                capture = start_capture(net, pcap) if first else None
+                nbytes = payload.stat().st_size
+                server = start_iperf_server(net, keep_output=True)  # ready before either client starts
+                t0 = time.time()
+                rudp = start_rudp(net, payload, work, stem, args.window, log)
+                tcp = start_iperf_client(net, server, "reno", nbytes)  # starts with RUDP's sender
+                tcp_row = finish_iperf(tcp, args.run_timeout)
+                rudp_row = finish_rudp(rudp, payload_sha, args.run_timeout)
+                stop_capture(capture)
+                for row in (rudp_row, tcp_row):
+                    row["flow"] = "concurrent"
+                    row["wall_start"] = t0
+                fairness = own_duration = ""
+                if rudp_row.get("ok") and tcp_row.get("ok"):
+                    # Reference only: each flow over its own duration (optimistic).
+                    own_duration = jains_fairness([float(rudp_row["goodput_mbps"]),
+                                                   float(tcp_row["goodput_mbps"])])
+                    overlap = None
+                    try:
+                        overlap = overlap_throughputs(
+                            rudp_delivery_curve(log),
+                            iperf_delivery_curve(tcp.get("server_output", ""), tcp["started"]),
+                        )
+                    except (OSError, ValueError, KeyError) as exc:
+                        rudp_row["error"] = tcp_row["error"] = f"overlap fairness failed: {exc}"
+                    if overlap is not None:
+                        rudp_mbps, tcp_mbps, window = overlap
+                        fairness = jains_fairness([rudp_mbps, tcp_mbps])
+                        total = rudp_mbps + tcp_mbps
+                        rudp_row.update(overlap_mbps=rudp_mbps, overlap_window_s=window,
+                                        share_of_total=rudp_mbps / total if total else "")
+                        tcp_row.update(overlap_mbps=tcp_mbps, overlap_window_s=window,
+                                       share_of_total=tcp_mbps / total if total else "")
+                for row in (rudp_row, tcp_row):
+                    row["fairness_index"] = fairness
+                    row["fairness_index_own_duration"] = own_duration
+                results = [rudp_row, tcp_row]
+            else:
+                capture = start_capture(net, pcap) if first else None
+                rudp_row = finish_rudp(
+                    start_rudp(net, payload, work, stem, args.window, log), payload_sha, args.run_timeout)
+                stop_capture(capture)
+                results.append(rudp_row)
+                for algorithm in ("reno", "cubic"):
+                    server = start_iperf_server(net)
+                    results.append(finish_iperf(
+                        start_iperf_client(net, server, algorithm, payload.stat().st_size),
+                        args.run_timeout))
+                for row in results:
+                    row["flow"] = "alone"
+            for row in results:
+                rows.append({**base, **row})
+                status = "ok" if row.get("ok") else f"FAILED ({row.get('error', '?')})"
+                print(f"  run {run} {row['protocol']:<10} "
+                      f"{float(row.get('goodput_mbps') or 0):7.2f} Mbit/s  {status}", flush=True)
+    finally:
+        net.stop()
+    return rows
 
-    raw_path = output / "raw.csv"
-    fields = sorted({key for row in raw for key in row})
-    with raw_path.open("w", newline="", encoding="utf-8") as stream:
+
+def write_outputs(rows: list[dict], output: Path) -> None:
+    fields = sorted({key for row in rows for key in row})
+    with (output / "raw.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(raw)
+        writer.writerows(rows)
 
-    groups: dict[tuple[str, str, str], list[dict[str, object]]] = {}
-    for row in raw:
-        key = (str(row["experiment"]), str(row["condition"]), str(row["protocol"]))
-        groups.setdefault(key, []).append(row)
+    def spread(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return "", ""
+        return statistics.mean(values), (statistics.stdev(values) if len(values) > 1 else 0.0)
+
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for row in rows:
+        groups.setdefault((row["experiment"], row["condition"], row["protocol"]), []).append(row)
     with (output / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow([
-            "experiment", "condition", "protocol", "runs",
+            "experiment", "condition", "protocol", "runs", "runs_ok",
             "mean_goodput_mbps", "stddev_goodput_mbps",
-            "range_goodput_mbps", "mean_completion_time_s", "stddev_completion_time_s",
+            "mean_completion_time_s", "stddev_completion_time_s",
             "mean_retransmissions", "stddev_retransmissions",
             "mean_rtt_estimate_s", "stddev_rtt_estimate_s",
+            "mean_queue_delay_ms", "stddev_queue_delay_ms",
+            "mean_fairness_index", "mean_share_of_total",
         ])
-        for (experiment, condition, protocol), rows in sorted(groups.items()):
-            def values(field: str) -> list[float]:
-                return [
-                    float(row[field]) for row in rows
-                    if row.get(field) not in (None, "")
-                    and str(row.get(field)).strip() != ""
-                ]
+        for (experiment, condition, protocol), group in sorted(groups.items()):
+            good = [row for row in group if row.get("ok")]
 
-            goodput = values("goodput_mbps")
-            completion = values("completion_time_s")
-            retransmissions = values("retransmissions")
-            rtt = values("rtt_estimate_s")
+            def column(name: str) -> list[float]:
+                return [float(row[name]) for row in good if row.get(name) not in (None, "")]
 
-            def spread(items: list[float]) -> tuple[float, float]:
-                if not items:
-                    return 0.0, 0.0
-                mean_value = statistics.mean(items)
-                stddev = statistics.stdev(items) if len(items) > 1 else 0.0
-                return mean_value, stddev
-
-            mean_goodput, stddev_goodput = spread(goodput)
-            mean_completion, stddev_completion = spread(completion)
-            mean_retx, stddev_retx = spread(retransmissions)
-            mean_rtt, stddev_rtt = spread(rtt)
+            goodput = spread(column("goodput_mbps"))
+            completion = spread(column("completion_time_s"))
+            retx = spread(column("retransmissions"))
+            rtt = spread(column("rtt_estimate_s"))
+            queue = spread(column("queue_delay_ms"))
+            fairness = column("fairness_index")
+            share = column("share_of_total")
             writer.writerow([
-                experiment, condition, protocol, len(rows),
-                mean_goodput, stddev_goodput,
-                f"{max(goodput) - min(goodput):.6g}" if goodput else "0",
-                mean_completion, stddev_completion,
-                mean_retx, stddev_retx, mean_rtt, stddev_rtt,
+                experiment, condition, protocol, len(group), len(good),
+                *goodput, *completion, *retx, *rtt, *queue,
+                statistics.mean(fairness) if fairness else "",
+                statistics.mean(share) if share else "",
             ])
 
 
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--runs", type=int, default=3, help="runs per condition (default 3)")
+    parser.add_argument("--payload-mib", type=float, default=10)
+    parser.add_argument("--results", type=Path, default=ROOT / "results")
+    parser.add_argument("--only", nargs="+", metavar="EXP",
+                        help="run only these experiments, e.g. Exp1 Exp4")
+    parser.add_argument("--capture-runs", type=int, default=1,
+                        help="write pcapng captures for the first N runs of each condition "
+                             "(RUDP event logs are written for every run)")
+    parser.add_argument("--queue-packets", type=int, default=100)
+    parser.add_argument("--window", type=int, default=1024)
+    parser.add_argument("--run-timeout", type=float, default=900,
+                        help="seconds before one transfer is declared failed")
+    parser.add_argument("--list", action="store_true",
+                        help="print the planned matrix and exit (no network, no results)")
+    args = parser.parse_args()
+    if args.runs < 1:
+        parser.error("--runs must be positive")
+    selected = [c for c in conditions() if not args.only or c.experiment in args.only]
+    if not selected:
+        parser.error(f"no experiments match {args.only}")
+
+    if args.list:
+        for cond in selected:
+            print(f"{cond.experiment:5} {cond.name:16} RTT {cond.rtt_ms:6g} ms  "
+                  f"loss {cond.loss_pct:g}%  rate {cond.rate_mbps:g} Mbit/s  x{args.runs} runs"
+                  + ("  (RUDP and TCP concurrently)" if cond.concurrent else ""))
+        return 0
+
+    import os
+    if os.geteuid() != 0:
+        raise SystemExit("run as root: sudo .venv/bin/python experiments/run_experiments.py")
+    args.results = args.results.resolve()
+    for sub in ("logs", "pcaps"):
+        (args.results / sub).mkdir(parents=True, exist_ok=True)
+    work = args.results / "work"
+    work.mkdir(exist_ok=True)
+    payload = work / f"payload-{args.payload_mib:g}MiB.bin"
+    payload_sha = ensure_payload(payload, int(args.payload_mib * MIB))
+
+    rows: list[dict] = []
+    try:
+        for cond in selected:
+            rows.extend(run_condition(cond, args, payload, payload_sha, work))
+            write_outputs(rows, args.results)  # keep partial results if a later condition fails
+    finally:
+        if rows:
+            write_outputs(rows, args.results)
+    failed = [row for row in rows if not row.get("ok")]
+    print(f"\n{len(rows) - len(failed)}/{len(rows)} transfers succeeded; "
+          f"results in {args.results}/raw.csv and summary.csv")
+    return 1 if failed else 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

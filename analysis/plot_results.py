@@ -20,7 +20,7 @@ def load_rows(path: Path) -> list[dict[str, str]]:
 def grouped(rows: list[dict[str, str]], x_field: str, experiment: str) -> dict[str, dict[str, list[float]]]:
     result: dict[str, dict[str, list[float]]] = {}
     for row in rows:
-        if row["experiment"] != experiment:
+        if row["experiment"] != experiment or row.get("ok") not in ("True", "true", "1"):
             continue
         protocol = row["protocol"]
         x_value = row[x_field]
@@ -46,56 +46,93 @@ def plot_goodput(rows: list[dict[str, str]], output: Path, x_field: str, experim
     plt.close(figure)
 
 
+def _rudp_events(path: Path) -> list[dict]:
+    events = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
 def plot_cwnd(logs: Path, output: Path) -> None:
+    """One cwnd/ssthresh-vs-time figure per RUDP event log (sawtooth under loss)."""
+
     import matplotlib.pyplot as plt
 
-    figure, axis = plt.subplots()
-    for path in sorted(logs.glob("*.jsonl")):
-        times: list[float] = []
-        cwnd: list[float] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get("event") == "congestion_event" and "cwnd" in record:
-                times.append(float(record.get("monotonic", record.get("time", 0))))
-                cwnd.append(float(record["cwnd"]))
-        if times:
-            axis.plot(times, cwnd, label=path.stem)
-    axis.set(title="Congestion window over time", xlabel="Monotonic time (s)", ylabel="cwnd (packets)")
-    axis.grid(alpha=0.3)
-    if axis.lines:
-        axis.legend(fontsize="small")
-    figure.tight_layout()
-    figure.savefig(output / "cwnd_over_time.png", dpi=160)
-    plt.close(figure)
+    for path in sorted(logs.glob("*_rudp.jsonl")):
+        events = _rudp_events(path)
+        points = [e for e in events if e.get("event") == "congestion_event" and "cwnd" in e]
+        if not points:
+            continue
+        t0 = float(points[0].get("monotonic", 0))
+        times = [float(e["monotonic"]) - t0 for e in points]
+        figure, axis = plt.subplots()
+        axis.plot(times, [e["cwnd"] for e in points], label="cwnd", linewidth=1)
+        axis.plot(times, [e["ssthresh"] for e in points], "--", label="ssthresh", linewidth=1)
+        losses = [float(e["monotonic"]) - t0 for e in events if e.get("event") == "timeout"]
+        axis.plot(losses, [0] * len(losses), "rx", label="timeout")
+        axis.set(title=f"Congestion window: {path.stem.replace('_rudp', '')}",
+                 xlabel="Time since first ACK (s)", ylabel="packets")
+        axis.grid(alpha=0.3)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(output / f"cwnd_{path.stem.replace('_rudp', '')}.png", dpi=160)
+        plt.close(figure)
 
 
 def plot_rtt(rows: list[dict[str, str]], output: Path) -> None:
+    """RUDP smoothed RTT and minimum RTT against the configured RTT (Exp2)."""
+
     import matplotlib.pyplot as plt
 
-    points = [(float(row["delay_ms"]) * 2, float(row["rtt_estimate_s"]) * 1000)
-              for row in rows if row.get("rtt_estimate_s")]
+    points = sorted(
+        {(float(r["rtt_ms"]), float(r["rtt_estimate_s"]) * 1000,
+          float(r["min_rtt_s"]) * 1000 if r.get("min_rtt_s") else float("nan"))
+         for r in rows
+         if r["experiment"] == "Exp2" and r["protocol"] == "RUDP"
+         and r.get("ok") in ("True", "true", "1") and r.get("rtt_estimate_s")}
+    )
     figure, axis = plt.subplots()
     if points:
-        x_values, y_values = zip(*points)
-        axis.plot(x_values, y_values, "o-")
-    axis.set(title="RTT estimate versus measured RTT", xlabel="Measured RTT (ms)", ylabel="Estimated RTT (ms)")
+        configured, smoothed, minimum = zip(*points)
+        axis.plot(configured, smoothed, "o-", label="RUDP smoothed RTT (includes queueing)")
+        axis.plot(configured, minimum, "s--", label="RUDP minimum RTT sample")
+        axis.plot(configured, configured, "k:", label="configured RTT (y = x)")
+        axis.legend()
+    axis.set(title="RTT estimate versus configured RTT",
+             xlabel="Configured RTT (ms)", ylabel="RTT (ms)")
     axis.grid(alpha=0.3)
     figure.tight_layout()
-    figure.savefig(output / "rtt_estimate_vs_measured.png", dpi=160)
+    figure.savefig(output / "rtt_estimate_vs_configured.png", dpi=160)
     plt.close(figure)
 
 
 def plot_fairness(rows: list[dict[str, str]], output: Path) -> None:
     import matplotlib.pyplot as plt
 
-    values = [float(row["fairness_index"]) for row in rows if row.get("fairness_index")]
+    runs: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if row["experiment"] != "Exp4" or row.get("ok") not in ("True", "true", "1"):
+            continue
+        value = row.get("overlap_mbps") or row["goodput_mbps"]  # overlap window when measured
+        runs.setdefault(row["run"], {})[row["protocol"]] = float(value)
     figure, axis = plt.subplots()
-    axis.bar(["RUDP + TCP"], [mean(values) if values else 0.0])
-    axis.set_ylim(0, 1)
-    axis.set(title="Jain fairness index", ylabel="Fairness")
+    labels = [f"run {run}" for run in sorted(runs)]
+    rudp = [runs[run].get("RUDP", 0) for run in sorted(runs)]
+    tcp = [runs[run].get("TCP-RENO", 0) for run in sorted(runs)]
+    positions = range(len(labels))
+    axis.bar([p - 0.2 for p in positions], rudp, 0.4, label="RUDP")
+    axis.bar([p + 0.2 for p in positions], tcp, 0.4, label="TCP Reno")
+    axis.set_xticks(list(positions), labels)
+    values = [float(row["fairness_index"]) for row in rows
+              if row["experiment"] == "Exp4" and row.get("fairness_index") not in (None, "")
+              and row["protocol"] == "RUDP"]
+    axis.set(title=f"Concurrent flows on a shared bottleneck (Jain index {mean(values):.2f})"
+             if values else "Concurrent flows on a shared bottleneck",
+             ylabel="Throughput while both flows run (Mbit/s)")
+    axis.legend()
     figure.tight_layout()
     figure.savefig(output / "fairness.png", dpi=160)
     plt.close(figure)
