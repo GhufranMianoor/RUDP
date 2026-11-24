@@ -19,6 +19,9 @@ source .venv/bin/activate
 The setup script installs Mininet, Open vSwitch, iperf3, Wireshark/tshark,
 Python venv support, and the Python dependencies in `requirements.txt`.
 
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the complete topology,
+address plan, interfaces, ports, protocol flows, and router impairments.
+
 ## Local transfer
 
 ```bash
@@ -79,6 +82,16 @@ sudo tools/capture_runs.sh R1-eth3 results/pcaps 30
 
 Load `tools/rudp_dissector.lua` in Wireshark via **Analyze > Lua Plugins**.
 The dissector recognizes RUDP on UDP port 9000.
+
+Annotated evidence should be recorded using Wireshark:
+
+1. Capture `UDP port 9000` while a transfer is running.
+2. Filter with `rudp || udp.port == 9000`.
+3. Select SYN, SYN+ACK, ACK, DATA, SACK, and FIN packets.
+4. Add columns for source, destination, source port, destination port,
+   protocol, sequence, and acknowledgement.
+5. Export the relevant frames and save annotated PNG screenshots in
+   `results/evidence/`.
 
 ## Known limitations
 

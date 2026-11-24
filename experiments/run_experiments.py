@@ -73,20 +73,37 @@ def run_rudp(condition: Condition, payload: Path, output: Path, host: str, port:
              dry_run: bool) -> dict[str, object]:
     log = output / "logs" / f"{condition.experiment}_{condition.name}_rudp.jsonl"
     received = output / f"{condition.experiment}_{condition.name}_received.bin"
+    pcap = output / "pcaps" / f"{condition.experiment}_{condition.name}_rudp.pcapng"
     receiver = [sys.executable, str(ROOT / "apps/recv_file.py"), str(port), str(received)]
     sender = [
         sys.executable, str(ROOT / "apps/send_file.py"), host, str(port), str(payload),
         "--cc", "reno", "--log", str(log),
     ]
     started = time.monotonic()
+    capture = None
     if not dry_run:
+        interface = "any"
+        dumpcap = shutil.which("dumpcap")
+        if dumpcap:
+            capture = subprocess.Popen(
+                [dumpcap, "-q", "-i", interface, "-f", f"udp port {port}",
+                 "-w", str(pcap)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
         with subprocess.Popen(receiver, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
             subprocess.run(sender, cwd=ROOT, check=True, timeout=300)
+        if capture is not None:
+            capture.terminate()
+            capture.wait(timeout=10)
     elapsed = time.monotonic() - started
+    if dry_run:
+        elapsed = 0.1
     retransmissions, rtt = parse_event_log(log)
     goodput = PAYLOAD_SIZE * 8 / elapsed / 1_000_000 if elapsed else 0.0
     return {
         "protocol": "RUDP",
+        "pcap": str(pcap),
         "completion_time_s": elapsed,
         "goodput_mbps": goodput,
         "retransmissions": retransmissions,
@@ -111,6 +128,8 @@ def run_tcp(condition: Condition, payload: Path, output: Path, host: str, port: 
             result = subprocess.run(client, cwd=ROOT, check=True, capture_output=True, text=True, timeout=300)
             output_json = result.stdout
     elapsed = time.monotonic() - started
+    if dry_run:
+        elapsed = 0.1
     goodput = PAYLOAD_SIZE * 8 / elapsed / 1_000_000 if elapsed else 0.0
     if output_json:
         try:
@@ -185,18 +204,49 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(raw)
 
-    groups: dict[tuple[str, str, str], list[float]] = {}
+    groups: dict[tuple[str, str, str], list[dict[str, object]]] = {}
     for row in raw:
         key = (str(row["experiment"]), str(row["condition"]), str(row["protocol"]))
-        groups.setdefault(key, []).append(float(row["goodput_mbps"]))
+        groups.setdefault(key, []).append(row)
     with (output / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["experiment", "condition", "protocol", "runs", "mean_goodput_mbps", "stddev_goodput_mbps"])
-        for (experiment, condition, protocol), values in sorted(groups.items()):
+        writer.writerow([
+            "experiment", "condition", "protocol", "runs",
+            "mean_goodput_mbps", "stddev_goodput_mbps",
+            "range_goodput_mbps", "mean_completion_time_s", "stddev_completion_time_s",
+            "mean_retransmissions", "stddev_retransmissions",
+            "mean_rtt_estimate_s", "stddev_rtt_estimate_s",
+        ])
+        for (experiment, condition, protocol), rows in sorted(groups.items()):
+            def values(field: str) -> list[float]:
+                return [
+                    float(row[field]) for row in rows
+                    if row.get(field) not in (None, "")
+                    and str(row.get(field)).strip() != ""
+                ]
+
+            goodput = values("goodput_mbps")
+            completion = values("completion_time_s")
+            retransmissions = values("retransmissions")
+            rtt = values("rtt_estimate_s")
+
+            def spread(items: list[float]) -> tuple[float, float]:
+                if not items:
+                    return 0.0, 0.0
+                mean_value = statistics.mean(items)
+                stddev = statistics.stdev(items) if len(items) > 1 else 0.0
+                return mean_value, stddev
+
+            mean_goodput, stddev_goodput = spread(goodput)
+            mean_completion, stddev_completion = spread(completion)
+            mean_retx, stddev_retx = spread(retransmissions)
+            mean_rtt, stddev_rtt = spread(rtt)
             writer.writerow([
-                experiment, condition, protocol, len(values),
-                statistics.mean(values),
-                statistics.stdev(values) if len(values) > 1 else 0.0,
+                experiment, condition, protocol, len(rows),
+                mean_goodput, stddev_goodput,
+                f"{max(goodput) - min(goodput):.6g}" if goodput else "0",
+                mean_completion, stddev_completion,
+                mean_retx, stddev_retx, mean_rtt, stddev_rtt,
             ])
 
 
