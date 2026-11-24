@@ -39,13 +39,11 @@ kernel module.
 
 - **Architecture figure**: `docs/figures/architecture.svg/.png` is done and matches the proposal's addressing plan; check it against what you actually demo.
 
-## Still to write (cannot be done before the measurements exist)
+## Results and report
 
-- Results and discussion in `REPORT.md` (`python analysis/make_report_tables.py`
-  prints the tables from `results/summary.csv`).
-- Names, roll numbers and the contributions section; make them match who did what.
-- `docs/AI_USE_LOG.md`: add the team's other AI use; the entry for this round of
-  fixes is already written.
+- Full matrix done on the lab VM: 3 runs per condition, 2 MiB per transfer, 117/117 transfers
+  verified (`results/full/`, tables in `results/full/report_tables.md`, plots in `results/full/plots/`).
+- Routed evidence traces in `results/pcaps/`; final report in `REPORT.md` and `docs/RUDP_Technical_Report.pdf`.
 
 ## Known limitations
 
