@@ -1,0 +1,83 @@
+
+== h1 interfaces and routes ==
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+h1-eth0@if14     UP             10.0.1.10/24 fe80::200:ff:fe00:3/64 
+
+default via 10.0.1.1 dev h1-eth0 
+10.0.1.0/24 dev h1-eth0 proto kernel scope link src 10.0.1.10 
+
+
+== h2 interfaces and routes ==
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+h2-eth0@if15     UP             10.0.3.10/24 fe80::200:ff:fe00:4/64 
+
+default via 10.0.3.1 dev h2-eth0 
+10.0.3.0/24 dev h2-eth0 proto kernel scope link src 10.0.3.10 
+
+
+== h3 interfaces and routes ==
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+h3-eth0@if16     UP             10.0.1.11/24 fe80::200:ff:fe00:5/64 
+
+default via 10.0.1.1 dev h3-eth0 
+10.0.1.0/24 dev h3-eth0 proto kernel scope link src 10.0.1.11 
+
+
+== h4 interfaces and routes ==
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+h4-eth0@if17     UP             10.0.3.11/24 fe80::200:ff:fe00:6/64 
+
+default via 10.0.3.1 dev h4-eth0 
+10.0.3.0/24 dev h4-eth0 proto kernel scope link src 10.0.3.11 
+
+
+== R1 interfaces and routes ==
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+R1-eth1@if2      UP             10.0.2.1/24 
+R1-eth0@if12     UP             10.0.1.1/24 
+
+10.0.1.0/24 dev R1-eth0 proto kernel scope link src 10.0.1.1 
+10.0.2.0/24 dev R1-eth1 proto kernel scope link src 10.0.2.1 
+10.0.3.0/24 via 10.0.2.2 dev R1-eth1 
+
+
+== R2 interfaces and routes ==
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+R2-eth0@if2      UP             10.0.2.2/24 
+R2-eth1@if13     UP             10.0.3.1/24 
+
+10.0.1.0/24 via 10.0.2.1 dev R2-eth0 
+10.0.2.0/24 dev R2-eth0 proto kernel scope link src 10.0.2.2 
+10.0.3.0/24 dev R2-eth1 proto kernel scope link src 10.0.3.1 
+
+== impairment on the bottleneck ==
+-- R1 R1-eth1
+qdisc netem 1: root refcnt 5 limit 10000 delay 25ms loss 2%
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+qdisc tbf 10: parent 1:1 rate 10Mbit burst 15000b lat 108ms 
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+
+-- R2 R2-eth0
+qdisc netem 1: root refcnt 5 limit 10000 delay 25ms loss 2%
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+qdisc tbf 10: parent 1:1 rate 10Mbit burst 15000b lat 108ms 
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0) 
+ backlog 0b 0p requeues 0
+
+[PASS] ping h1 -> h2: 0.0% loss
+[PASS] ping h3 -> h4: 0.0% loss
+traceroute to 10.0.3.10 (10.0.3.10), 5 hops max, 60 byte packets
+ 1  10.0.1.1  1.612 ms  0.043 ms  0.289 ms
+ 2  10.0.2.2  57.758 ms  57.714 ms *
+ 3  10.0.3.10  57.591 ms  57.567 ms  56.703 ms
+
+[PASS] traceroute h1 -> h2: hops ['10.0.1.1', '10.0.2.2', '10.0.3.10'] expected ['10.0.1.1', '10.0.2.2', '10.0.3.10']
+[PASS] ping RTT: measured 58.587 ms, configured 50 ms
+[INFO] ping loss over 200 packets: 4.0% (per-direction 2.0% -> expected round-trip about 4.0%)
+[PASS] iperf3 TCP throughput: 1.90 Mbit/s = 19% of 10mbit; loss-limited TCP model (Mathis) predicts about 2.00 Mbit/s (95% of that)
+[PASS] RUDP transfer h1 -> h2 (SHA-256): {"ok": true, "error": "", "bytes": 2097152, "seconds": 12.632628928000031, "goodput_mbps": 1.328085871564988, "cc": "reno", "fast_retransmits": 29, "timeouts": 2, "retransmissions": 42, "samples": 1706, "srtt": 0.060470357130140276, "min_rtt": 0.05109876200003782, "mean_rtt": 0.06881856241265658}
+
+ALL CHECKS PASSED

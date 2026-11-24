@@ -1,0 +1,1 @@
+{"ok": true, "error": "", "bytes": 2097152, "seconds": 1.9944743709993418, "goodput_mbps": 8.411848376669631, "cc": "reno", "fast_retransmits": 197, "timeouts": 0, "retransmissions": 197, "samples": 1557, "srtt": 0.10293112116818984, "min_rtt": 0.1009227220001776, "mean_rtt": 0.12520220379448677}
