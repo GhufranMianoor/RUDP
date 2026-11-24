@@ -9,18 +9,20 @@ then for each run:
 * ping     h1 -> h2, 20 probes on the idle path: the independently measured RTT
 * RUDP     h1 -> h2, UDP 9000, verified by SHA-256 (Reno controller; add
   ``--rudp-cc reno cubic`` to also run the CUBIC controller)
-* TCP Reno h3 -> h4, iperf3 on TCP 5201 (``-C reno``)
-* TCP CUBIC h3 -> h4, iperf3 on TCP 5201 (``-C cubic``)
+* TCP Reno h3 -> h4, ``apps/tcp_bulk.py`` on TCP 5201 (``--cc reno``)
+* TCP CUBIC h3 -> h4, ``apps/tcp_bulk.py`` on TCP 5201 (``--cc cubic``)
 
-The fairness experiment (Exp4) instead runs RUDP (h1 -> h2) and iperf3
+The fairness experiment (Exp4) instead runs RUDP (h1 -> h2) and TCP
 (h3 -> h4) *at the same time* over the shared bottleneck, at RTT 20, 100 and
 200 ms, each against TCP Reno (``fairness_reno_rtt*``) and against TCP CUBIC
 (``fairness_cubic_rtt*``).
 
 Goodput is application bytes divided by the transfer time: for RUDP the
 sender-measured time from the end of the handshake to the FIN being
-acknowledged; for TCP, iperf3's ``sum_received`` (bytes and seconds seen by
-the receiver). Packet captures are taken inside R1 on its sender-side (LAN)
+acknowledged; for TCP, the receiver-measured time from accepting the connection to
+the last byte (``apps/tcp_bulk.py``; ``iperf3 -n`` is not used because it stops
+counting as soon as the sender has *written* the bytes, while most are still
+queued). Packet captures are taken inside R1 on its sender-side (LAN)
 interface for the first run of each condition; RUDP event logs for every run.
 Exp4 fairness uses both flows' throughput over the window in which both are
 running (``experiments/fairness.py``), not each flow over its own duration.
@@ -212,31 +214,33 @@ def _kill(row: dict, *processes) -> dict:
     return row
 
 
-def start_iperf_server(net, keep_output: bool = False):
-    """iperf3 server on h4; returns once it is actually listening.
+def start_iperf_server(net, keep_output: bool = True):
+    """TCP bulk receiver (``apps/tcp_bulk.py server``) on h4, once it is listening.
 
-    With ``keep_output`` the server's JSON (receiver-side 0.5 s intervals) is
-    kept, which Exp4 uses to measure TCP over the overlap window.
+    Its JSON output has receiver-side 0.5 s intervals in iperf3's shape, which
+    Exp4 uses to measure TCP over the overlap window. ``keep_output`` is kept
+    for compatibility; the output is always small, so it is always read.
     """
 
     server = net[H4].popen(
-        ["iperf3", "-s", "-1", "-p", str(IPERF_PORT), "-J", "-i", "0.5"],
-        stdout=subprocess.PIPE if keep_output else subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, text=True,
+        [sys.executable, str(ROOT / "apps/tcp_bulk.py"), "server", str(IPERF_PORT),
+         "--interval", "0.5"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     for _ in range(50):
         if "LISTEN" in net[H4].cmd(f"ss -ltn 'sport = :{IPERF_PORT}'"):
             return server
         time.sleep(0.1)
     server.kill()
-    raise RuntimeError("iperf3 server did not start listening on h4")
+    raise RuntimeError("TCP receiver did not start listening on h4")
 
 
 def start_iperf_client(net, server, algorithm: str, nbytes: int) -> dict:
-    command = ["iperf3", "-c", DST_TCP, "-p", str(IPERF_PORT), "-C", algorithm,
-               "-n", str(nbytes), "-J"]
+    command = [sys.executable, str(ROOT / "apps/tcp_bulk.py"), "client", DST_TCP,
+               str(IPERF_PORT), str(nbytes), "--cc", algorithm]
     client = net[H3].popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return {"server": server, "client": client, "command": " ".join(command),
+    shown = f"apps/tcp_bulk.py client {DST_TCP} {IPERF_PORT} {nbytes} --cc {algorithm}"
+    return {"server": server, "client": client, "command": shown,
             "algorithm": algorithm, "nbytes": nbytes, "started": time.monotonic()}
 
 
@@ -248,33 +252,29 @@ def finish_iperf(handle: dict, timeout: float) -> dict:
     }
     try:
         out, err = client.communicate(timeout=timeout)
-        if server.stdout is not None:
-            handle["server_output"], _ = server.communicate(timeout=30)
-        else:
-            server.wait(timeout=30)
+        handle["server_output"], server_err = server.communicate(timeout=30)
     except subprocess.TimeoutExpired:
         row["error"] = "timeout"
         return _kill(row, client, server)
     try:
-        end = json.loads(out)["end"]
+        result = json.loads(out)
+        end = result["end"]
         received, sent = end["sum_received"], end["sum_sent"]
-        # iperf3 -n ends the test when the sender has written all bytes; data
-        # still queued at the bottleneck is not yet in sum_received (about
-        # queue + BDP, ~0.3 MB), so a 95% threshold is used. With >= 10 MiB
-        # payloads that under-counts TCP goodput by <= ~3%.
+        # The receiver reads until the sender's FIN, so every byte is counted
+        # and the time runs to the last byte delivered (same as RUDP).
         row.update(
-            ok=sent["bytes"] >= handle["nbytes"] and received["bytes"] >= handle["nbytes"] * 0.95,
-            goodput_mbps=received["bits_per_second"] / 1e6,   # receiver side, not sum_sent
+            ok=received["bytes"] == handle["nbytes"],
+            goodput_mbps=received["bits_per_second"] / 1e6,
             completion_time_s=received["seconds"],
             retransmissions=sent.get("retransmits", ""),
             bytes_received=received["bytes"],
             bytes_sent=sent["bytes"],
-            rtt_estimate_s="",
+            rtt_estimate_s=(result.get("tcp", {}).get("rtt_ms", 0) or 0) / 1000 or "",
         )
         if not row["ok"]:
             row["error"] = f"only {received['bytes']} of {handle['nbytes']} bytes received"
-    except (KeyError, ValueError, json.JSONDecodeError):
-        row["error"] = (err or out or "no iperf3 output").strip()[:200]
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        row["error"] = (err or out or server_err or "no TCP transfer output").strip()[:200]
     return row
 
 

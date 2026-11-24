@@ -241,7 +241,8 @@ and are retransmitted only as the window allows, so a timeout while cwnd = 1
 sends one packet, not the whole window.
 
 **Timing.** Initial RTO 1 s (RFC 6298), seeded by the handshake RTT, then
-`srtt + 4 * rttvar` clamped to [`MIN_RTO` 0.2 s, `MAX_RTO` 5 s]. The sender waits
+`srtt + max(RTO_VARIANCE_FLOOR, 4 * rttvar)` (floor 0.2 s, like Linux; see REPORT.md 4.4)
+clamped to [`MIN_RTO` 0.2 s, `MAX_RTO` 5 s]. The sender waits
 on the socket only until the next timer could fire. RTT samples come from
 sender-local send times with Karn's algorithm (retransmitted packets are never
 sampled). The `timestamp` field of every transmission, including

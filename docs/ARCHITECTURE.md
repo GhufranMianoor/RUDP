@@ -26,7 +26,7 @@ flowchart LR
   subgraph C["Subnet C — 10.0.3.0/24"]
     sC["sC — Ethernet switch"]
     h2["h2 — RUDP receiver\n10.0.3.10\nUDP 9000"]
-    h4["h4 — iperf3 server\n10.0.3.11\nTCP 5201"]
+    h4["h4 — TCP receiver (tcp_bulk / iperf3)\n10.0.3.11\nTCP 5201"]
     sC --- h2
     sC --- h4
   end
@@ -45,7 +45,7 @@ flowchart LR
 | R2 | R2-eth0 | 10.0.2.2/24 | Router, subnet B |
 | R2 | R2-eth1 | 10.0.3.1/24 | Router, subnet C |
 | h2 | h2-eth0 | 10.0.3.10/24 | RUDP receiver, UDP 9000 |
-| h4 | h4-eth0 | 10.0.3.11/24 | iperf3 server, TCP 5201 |
+| h4 | h4-eth0 | 10.0.3.11/24 | TCP receiver (`apps/tcp_bulk.py`; iperf3 for the rate check), TCP 5201 |
 
 Subnet A is a shared Ethernet LAN through sA; subnet C is a shared Ethernet
 LAN through sC. Subnet B is the point-to-point R1–R2 link. This is necessary
@@ -103,7 +103,8 @@ The check prints addresses, routes and `tc -s qdisc`, then asserts:
 1. `ping` h1 -> h2 and h3 -> h4 succeed;
 2. `traceroute` from h1 shows `10.0.1.1`, `10.0.2.2`, `10.0.3.10`;
 3. ping RTT matches 2 x `--delay` (within 20% + 6 ms);
-4. iperf3 TCP h3 -> h4 reaches at least 80% of `--rate` (30% when loss is configured);
+4. iperf3 TCP h3 -> h4 reaches at least 80% of `--rate`; with loss configured, 0.5x to 2x of
+   the Mathis model's loss-limited rate (1.22 x MSS / (RTT x sqrt(p)), about 2 Mbit/s at 50 ms and 2%);
 5. a 2 MiB RUDP transfer h1 -> h2 has an identical SHA-256.
 
 It also prints the observed ping loss, for information only, because loss is

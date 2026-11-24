@@ -326,13 +326,22 @@ def run_check(net, project_root: Path, delay: str, loss: str, rate: str) -> bool
             bits = json.loads(out)["end"]["sum_received"]["bits_per_second"]
             configured_bps = parse_rate_bps(rate)
             ratio = bits / configured_bps
-            lossy = configured > 0
-            record(
-                "iperf3 TCP throughput",
-                ratio >= (0.3 if lossy else 0.8) and ratio <= 1.05,
-                f"{bits / 1e6:.2f} Mbit/s = {ratio:.0%} of {rate}"
-                + (" (loss lowers TCP throughput)" if lossy else ""),
-            )
+            if configured > 0:
+                # With random loss TCP cannot fill the link. The Mathis et al.
+                # model, rate ~ 1.22 * MSS / (RTT * sqrt(p)), is the expected
+                # ceiling (MSS 1448 B, p = data-direction loss); accept 0.5x-2x.
+                mathis_bps = 1.22 * 1448 * 8 / ((expected_rtt / 1000) * configured ** 0.5)
+                expected_bps = min(configured_bps, mathis_bps)
+                fit = bits / expected_bps
+                record(
+                    "iperf3 TCP throughput",
+                    0.5 <= fit <= 2.0 and ratio <= 1.05,
+                    f"{bits / 1e6:.2f} Mbit/s = {ratio:.0%} of {rate}; loss-limited TCP model "
+                    f"(Mathis) predicts about {expected_bps / 1e6:.2f} Mbit/s ({fit:.0%} of that)",
+                )
+            else:
+                record("iperf3 TCP throughput", 0.8 <= ratio <= 1.05,
+                       f"{bits / 1e6:.2f} Mbit/s = {ratio:.0%} of {rate}")
         except (KeyError, ValueError, json.JSONDecodeError):
             record("iperf3 TCP throughput", False, f"no result: {out.strip()[:200]}")
     else:

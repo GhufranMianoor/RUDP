@@ -16,7 +16,7 @@ from enum import Enum
 import time
 from typing import Any, Callable, Protocol, runtime_checkable
 
-from .constants import DEFAULT_RTO, DEFAULT_WINDOW, MAX_RTO, MIN_RTO
+from .constants import DEFAULT_RTO, DEFAULT_WINDOW, MAX_RTO, MIN_RTO, RTO_VARIANCE_FLOOR
 from .eventlog import EventLogger
 
 
@@ -113,7 +113,7 @@ class BaseController(ABC):
             assert self._rttvar is not None
             self._rttvar = 0.75 * self._rttvar + 0.25 * abs(self._srtt - rtt)
             self._srtt = 0.875 * self._srtt + 0.125 * rtt
-        self._timeout = min(maximum, max(minimum, self._srtt + max(0.001, 4 * self._rttvar)))
+        self._timeout = min(maximum, max(minimum, self._srtt + max(RTO_VARIANCE_FLOOR, 4 * self._rttvar)))
 
     def observe_rtt(self, rtt: float) -> None:
         """Seed the RTO estimator with a sample that must not move cwnd (handshake RTT)."""
