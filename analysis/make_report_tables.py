@@ -16,7 +16,7 @@ TITLES = {
     "Exp1": "Experiment 1 - packet loss (RTT 100 ms, 10 Mbit/s; loss is per direction)",
     "Exp2": "Experiment 2 - round-trip time (no loss, 10 Mbit/s)",
     "Exp3": "Experiment 3 - bottleneck rate (RTT 100 ms, no loss)",
-    "Exp4": "Experiment 4 - RUDP and TCP Reno competing on a 10 Mbit/s bottleneck",
+    "Exp4": "Experiment 4 - RUDP competing with TCP Reno and with TCP CUBIC on a 10 Mbit/s bottleneck",
 }
 
 
@@ -53,11 +53,32 @@ def main() -> None:
                 f"{number(row['mean_completion_time_s'])} +/- {number(row['stddev_completion_time_s'])} | "
                 f"{number(row['mean_retransmissions'], 1)} | {rtt} | {queue} |"
             )
+        if experiment == "Exp2":
+            print("\nRTT estimate versus measured RTT (ms; ping = 20 ICMP probes on the idle path "
+                  "before each run):\n")
+            print("| Condition | RUDP smoothed RTT | RUDP minimum RTT | ping average +/- sd | ping minimum |")
+            print("|---|---|---|---|---|")
+            for row in rows:
+                if row["experiment"] != "Exp2" or not row["protocol"].startswith("RUDP"):
+                    continue
+                try:
+                    srtt = number(str(float(row["mean_rtt_estimate_s"]) * 1000), 1)
+                except ValueError:
+                    srtt = "-"
+                print(f"| {row['condition']} ({row['protocol']}) | {srtt} | "
+                      f"{number(row.get('mean_min_rtt_ms', ''), 1)} | "
+                      f"{number(row.get('mean_ping_avg_rtt_ms', ''), 1)} +/- "
+                      f"{number(row.get('stddev_ping_avg_rtt_ms', ''), 1)} | "
+                      f"{number(row.get('mean_ping_min_rtt_ms', ''), 1)} |")
         if experiment == "Exp4":
-            shares = [(r["protocol"], r["mean_share_of_total"], r["mean_fairness_index"])
+            shares = [(r["condition"], r["protocol"], r["mean_share_of_total"], r["mean_fairness_index"])
                       for r in rows if r["experiment"] == "Exp4" and r["mean_fairness_index"]]
-            for protocol, share, jain in shares:
-                print(f"\n{protocol}: share of throughput while both run {number(str(float(share) * 100), 1)}%, "
+            for condition, protocol, share, jain in shares:
+                try:
+                    percent = number(str(float(share) * 100), 1)
+                except ValueError:
+                    percent = "-"
+                print(f"\n{condition}, {protocol}: share of throughput while both run {percent}%, "
                       f"Jain fairness index {number(jain, 3)}")
         print()
 

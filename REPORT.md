@@ -145,6 +145,26 @@ Every change of cwnd, ssthresh or state is written to a JSON-lines event log,
 which produces the cwnd plots. Logging is buffered in memory and written in
 batches, so it does not slow the sender down.
 
+### 4.3.1 CUBIC variant (RFC 8312 / RFC 9438)
+
+`CubicController` (`send_file.py --cc cubic`) keeps slow start, SACK recovery
+and the timeout response of the Reno controller and changes two things:
+
+- **Loss response.** ssthresh = cwnd = max(2, 0.7 cwnd) (beta = 0.7 instead of
+  0.5); the window at the loss is remembered as W_max. With fast convergence,
+  a loss below the previous W_max lowers W_max to W_max (1 + beta) / 2.
+- **Window growth in congestion avoidance** follows
+  W(t) = C (t - K)^3 + W_max with C = 0.4 and K = cbrt(W_max (1 - beta) / C),
+  where t is the time since the first ACK after recovery: fast (concave)
+  growth back towards W_max, a plateau around it, then accelerating (convex)
+  probing beyond it. Growth is independent of RTT, unlike Reno's +1 packet
+  per RTT. In the TCP-friendly region an estimate of Reno's window,
+  growing 3 (1 - beta)/(1 + beta) packets per RTT, is used when it is larger.
+
+Unit tests (`tests/test_cubic.py`) check the 0.7 reduction, fast convergence,
+the return to W_max after K seconds, convex growth beyond it, the TCP-friendly
+region and the timeout response with a simulated clock.
+
 ### 4.4 RTT estimation and RTO (RFC 6298)
 
 The sender records the send time of each packet. When a packet that was sent
@@ -234,14 +254,16 @@ Each condition runs in a freshly built network with a fixed 100-packet
 drop-tail queue at the bottleneck. Every run sends one 10 MiB file
 (deterministic pseudo-random content, SHA-256 checked for RUDP) with RUDP Reno
 (h1 to h2, UDP 9000), then TCP Reno and TCP CUBIC with iperf3 (h3 to h4, TCP
-5201). Three runs per condition; tables report mean and standard deviation.
+5201). Before each run, 20 ping probes from h1 to h2 on the idle path give an
+RTT measured independently of RUDP. Three runs per condition; tables report
+mean and standard deviation.
 
 | Experiment | Condition (others: RTT 100 ms, 10 Mbit/s, 0% loss) | Metrics |
 |---|---|---|
 | Exp1 | 0%, 2%, 5% loss per direction | Goodput, retransmissions, completion time |
-| Exp2 | 20 ms, 100 ms, 200 ms RTT | Goodput, RUDP RTT estimate vs configured RTT |
+| Exp2 | 20 ms, 100 ms, 200 ms RTT | Goodput, RUDP RTT estimate vs RTT measured by ping |
 | Exp3 | 5, 10, 20 Mbit/s bottleneck | Goodput, cwnd over time, RTT estimate above minimum RTT (queueing delay) |
-| Exp4 | RUDP and TCP Reno **concurrently** on 10 Mbit/s | Per-flow throughput, Jain's fairness index |
+| Exp4 | RUDP **concurrently** with TCP Reno, and with TCP CUBIC, on 10 Mbit/s | Per-flow throughput, Jain's fairness index |
 
 The comparison with TCP Reno and CUBIC (proposal experiment 4) is part of
 every Exp1 to Exp3 condition; the fairness test (proposal experiment 5) is
@@ -278,9 +300,9 @@ per condition.
 > `summary.csv`.
 
 *[Table and figure for Exp1: goodput versus loss]*
-*[Table and figure for Exp2: goodput versus RTT, and RTT estimate versus configured RTT]*
+*[Table and figure for Exp2: goodput versus RTT, and RTT estimate versus RTT measured by ping]*
 *[Table and figure for Exp3: goodput versus bottleneck rate]*
-*[Table for Exp4: shares of the bottleneck and Jain's index]*
+*[Table for Exp4: shares of the bottleneck and Jain's index, against TCP Reno and against TCP CUBIC]*
 *[Figure: cwnd and ssthresh over time showing slow start, the sawtooth, and any timeout]*
 
 ### 8.1 Discussion
@@ -288,9 +310,10 @@ per condition.
 *[To write from the measured data: how goodput falls with loss and why (Reno's
 response to loss, ACK loss because loss is per direction); behaviour at long RTT;
 whether RUDP approaches the bottleneck rate at 0% loss; how the RTT estimate compares
-with the configured RTT plus queueing (the 100-packet queue adds up to 240 ms at
-5 Mbit/s); how RUDP and TCP Reno share the link and whether the fairness index
-supports "TCP-friendly".]*
+with the RTT measured by ping plus queueing (the 100-packet queue adds up to 240 ms at
+5 Mbit/s); how RUDP shares the link with TCP Reno and with TCP CUBIC and whether the
+fairness index supports "TCP-friendly"; if `--rudp-cc reno cubic` was run, how the
+RUDP CUBIC controller compares with RUDP Reno, especially at 200 ms RTT.]*
 
 ## 9. Reproduction procedure
 

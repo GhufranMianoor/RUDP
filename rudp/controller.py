@@ -6,9 +6,6 @@ concrete implementations:
   - RenoController: RFC 5681 TCP Reno congestion control (Slow Start, Congestion
     Avoidance, Fast Retransmit, and Fast Recovery) with structured cwnd logging.
 
-Future weeks extend this foundation:
-  - Week 2: Dynamic RTO calculation and backoff (RFC 6298).
-  - Week 3: End-to-end Reno evaluation and tuning.
   - Week 4: CUBIC congestion controller variant (RFC 8312).
 """
 
@@ -340,9 +337,17 @@ class RenoController(BaseController):
         elif self._state == CongestionState.CONGESTION_AVOIDANCE:
             # Congestion avoidance: cwnd += 1 / cwnd per ACK (RFC 5681 3.1)
             # This yields +1.0 packet increase per RTT window of ACKs
-            increment = 1.0 / max(1.0, float(int(self._cwnd)))
-            self._cwnd = min(self._max_cwnd, self._cwnd + increment)
+            self._cwnd = self._congestion_avoidance_increase()
             self._log_state_change("congestion_avoidance_ack", sequence=sequence, rtt=rtt)
+
+    def _congestion_avoidance_increase(self) -> float:
+        """New cwnd after one ACK in congestion avoidance (Reno: +1 packet per RTT)."""
+        increment = 1.0 / max(1.0, float(int(self._cwnd)))
+        return min(self._max_cwnd, self._cwnd + increment)
+
+    def _reduce_on_loss(self) -> float:
+        """New ssthresh after a loss event (Reno: half the window, at least 2)."""
+        return max(2.0, self._cwnd / 2.0)
 
     def on_duplicate_ack(self, ack_number: int) -> bool:
         """Process a duplicate ACK.
@@ -354,7 +359,7 @@ class RenoController(BaseController):
 
         if self._dup_acks == self.DUP_ACK_THRESHOLD:
             # 3 Duplicate ACKs: Fast Retransmit & Fast Recovery (RFC 5681 3.2)
-            self._ssthresh = max(2.0, self._cwnd / 2.0)
+            self._ssthresh = self._reduce_on_loss()
             self._cwnd = self._ssthresh + float(self.DUP_ACK_THRESHOLD)
             self._state = CongestionState.FAST_RECOVERY
             self._managed_recovery = False
@@ -384,7 +389,7 @@ class RenoController(BaseController):
         """
         if self._state == CongestionState.FAST_RECOVERY and not self._managed_recovery:
             return
-        self._ssthresh = max(2.0, self._cwnd / 2.0)
+        self._ssthresh = self._reduce_on_loss()
         self._cwnd = self._ssthresh
         self._dup_acks = 0
         self._state = CongestionState.FAST_RECOVERY
@@ -407,7 +412,7 @@ class RenoController(BaseController):
           cwnd = 1 (or min_cwnd)
           state = Slow Start
         """
-        self._ssthresh = max(2.0, self._cwnd / 2.0)
+        self._ssthresh = self._reduce_on_loss()
         self._cwnd = self._min_cwnd
         self._dup_acks = 0
         self._state = CongestionState.SLOW_START
@@ -458,3 +463,128 @@ class RenoController(BaseController):
             "history_length": len(self._history),
         }
 
+
+
+class CubicController(RenoController):
+    """CUBIC congestion control (RFC 8312, updated by RFC 9438).
+
+    Slow start, SACK / duplicate-ACK recovery and the RTO response are inherited
+    from :class:`RenoController`; CUBIC changes two things:
+
+    * On a loss event ``ssthresh = max(2, beta * cwnd)`` with ``beta = 0.7``
+      (Reno: 0.5), and the window at the loss is remembered as ``W_max``. With
+      fast convergence, a loss below the previous ``W_max`` lowers it further
+      to ``W_max * (1 + beta) / 2`` so that a new flow can take bandwidth.
+    * In congestion avoidance the window follows the cubic function of the time
+      ``t`` since the current epoch began (the first ACK after recovery)::
+
+          W(t) = C * (t - K)^3 + W_max,   K = cbrt(W_max * (1 - beta) / C)
+
+      with ``C = 0.4`` packets/s^3: concave growth back towards ``W_max``, a
+      plateau around it, then convex probing beyond it. Each ACK moves cwnd by
+      ``(W(t + RTT) - cwnd) / cwnd``, capped at +50% per RTT.
+    * TCP-friendly region: an estimate of what Reno would have reached,
+      ``W_est``, grows by ``3 * (1 - beta) / (1 + beta)`` packets per RTT; when
+      it is larger than the cubic target, cwnd follows it (so CUBIC is never
+      slower than Reno on short-RTT paths).
+
+    Time comes from ``clock`` (``time.monotonic`` by default) so the window
+    growth can be tested deterministically.
+    """
+
+    C = 0.4
+    BETA = 0.7
+
+    def __init__(
+        self,
+        initial_cwnd: float = 1.0,
+        initial_ssthresh: float = 64.0,
+        min_cwnd: float = 1.0,
+        max_cwnd: float = 65535.0,
+        timeout: float = DEFAULT_RTO,
+        logger: EventLogger | None = None,
+        *,
+        fast_convergence: bool = True,
+        tcp_friendly: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._clock = clock
+        self._fast_convergence = fast_convergence
+        self._tcp_friendly = tcp_friendly
+        self._w_max: float = 0.0
+        self._w_last_max: float = 0.0
+        self._epoch_start: float | None = None
+        self._k: float = 0.0
+        self._origin: float = 0.0
+        self._w_est: float = 0.0
+        self._min_rtt: float | None = None
+        super().__init__(
+            initial_cwnd=initial_cwnd,
+            initial_ssthresh=initial_ssthresh,
+            min_cwnd=min_cwnd,
+            max_cwnd=max_cwnd,
+            timeout=timeout,
+            logger=logger,
+        )
+
+    @property
+    def w_max(self) -> float:
+        """Window size (packets) at the last loss event, after fast convergence."""
+        return self._w_max
+
+    @property
+    def k(self) -> float:
+        """Seconds the current epoch takes to grow back to ``W_max``."""
+        return self._k
+
+    def on_ack(self, sequence: int, rtt: float | None = None) -> None:
+        if rtt is not None and rtt > 0:
+            self._min_rtt = rtt if self._min_rtt is None else min(self._min_rtt, rtt)
+        super().on_ack(sequence, rtt)
+
+    def _reduce_on_loss(self) -> float:
+        self._epoch_start = None
+        if self._fast_convergence and self._cwnd < self._w_last_max:
+            self._w_last_max = self._cwnd
+            self._w_max = self._cwnd * (1.0 + self.BETA) / 2.0
+        else:
+            self._w_last_max = self._cwnd
+            self._w_max = self._cwnd
+        return max(2.0, self._cwnd * self.BETA)
+
+    def _congestion_avoidance_increase(self) -> float:
+        now = self._clock()
+        rtt = self._min_rtt or self._srtt or 0.1
+        cwnd = max(1.0, self._cwnd)
+        if self._epoch_start is None:
+            self._epoch_start = now
+            if cwnd < self._w_max:
+                self._k = ((self._w_max - cwnd) / self.C) ** (1.0 / 3.0)
+                self._origin = self._w_max
+            else:
+                self._k = 0.0
+                self._origin = cwnd
+            self._w_est = cwnd
+
+        elapsed = now - self._epoch_start + rtt  # where the window should be one RTT from now
+        target = self._origin + self.C * (elapsed - self._k) ** 3
+        target = min(max(target, cwnd), 1.5 * cwnd)
+        if target > cwnd:
+            increment = (target - cwnd) / cwnd
+        else:
+            increment = 0.01 / cwnd  # plateau: grow very slowly, never shrink on an ACK
+
+        if self._tcp_friendly:
+            self._w_est += 3.0 * (1.0 - self.BETA) / (1.0 + self.BETA) / cwnd
+            if self._w_est > cwnd:
+                increment = max(increment, (self._w_est - cwnd) / cwnd)
+
+        return min(self._max_cwnd, self._cwnd + increment)
+
+    def _log_state_change(self, trigger: str, **extra: Any) -> None:
+        super()._log_state_change(trigger, w_max=round(self._w_max, 4), **extra)
+
+    def stats(self) -> dict[str, Any]:
+        snapshot = super().stats()
+        snapshot.update(type="CubicController", w_max=self._w_max, k=self._k)
+        return snapshot

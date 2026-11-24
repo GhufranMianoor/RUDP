@@ -56,8 +56,9 @@ class RunnerTests(unittest.TestCase):
         for condition in run_experiments.conditions():
             by_experiment.setdefault(condition.experiment, []).append(condition)
         self.assertEqual({k: len(v) for k, v in by_experiment.items()},
-                         {"Exp1": 3, "Exp2": 3, "Exp3": 3, "Exp4": 1})
-        self.assertTrue(by_experiment["Exp4"][0].concurrent)
+                         {"Exp1": 3, "Exp2": 3, "Exp3": 3, "Exp4": 2})
+        self.assertTrue(all(c.concurrent for c in by_experiment["Exp4"]))
+        self.assertEqual({c.tcp_cc for c in by_experiment["Exp4"]}, {"reno", "cubic"})
         self.assertFalse(any(c.concurrent for e in ("Exp1", "Exp2", "Exp3") for c in by_experiment[e]))
 
     def test_rtt_is_twice_the_one_way_delay(self) -> None:
@@ -86,6 +87,59 @@ class RunnerTests(unittest.TestCase):
             capture_output=True, text=True, check=True,
         ).stdout
         self.assertIn("concurrently", out)
+        self.assertIn("CUBIC", out)
+
+    def test_parse_ping(self) -> None:
+        out = ("--- 10.0.3.10 ping statistics ---\n"
+               "20 packets transmitted, 19 received, 5% packet loss, time 3805ms\n"
+               "rtt min/avg/max/mdev = 100.112/101.420/104.900/1.050 ms\n")
+        stats = run_experiments.parse_ping(out)
+        self.assertEqual(stats["ping_loss_pct"], 5.0)
+        self.assertEqual(stats["ping_min_rtt_ms"], 100.112)
+        self.assertEqual(stats["ping_avg_rtt_ms"], 101.42)
+        self.assertEqual(stats["ping_mdev_ms"], 1.05)
+        self.assertEqual(run_experiments.parse_ping("100% packet loss")["ping_avg_rtt_ms"], "")
+
+    def test_summary_and_plots_include_ping_and_cubic_fairness(self) -> None:
+        import csv
+        import tempfile
+        rows = []
+        for run in (1, 2):
+            rows.append(dict(experiment="Exp2", condition="rtt_100ms", run=run, rtt_ms=100,
+                             delay_ms=50, loss_pct=0, rate_mbps=10, protocol="RUDP", ok=True,
+                             goodput_mbps=8.0, completion_time_s=10, retransmissions=0,
+                             rtt_estimate_s=0.104, min_rtt_s=0.1006, queue_delay_ms=3.4,
+                             ping_avg_rtt_ms=100.5 + run, ping_min_rtt_ms=100.2))
+            for cc in ("reno", "cubic"):
+                for protocol, overlap in (("RUDP", 4.0), (f"TCP-{cc.upper()}", 5.0)):
+                    rows.append(dict(experiment="Exp4", condition=f"fairness_{cc}", run=run,
+                                     rtt_ms=100, delay_ms=50, loss_pct=0, rate_mbps=10,
+                                     protocol=protocol, ok=True, goodput_mbps=overlap,
+                                     overlap_mbps=overlap, share_of_total=overlap / 9,
+                                     fairness_index=0.99))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            run_experiments.write_outputs(rows, out)
+            with (out / "summary.csv").open() as stream:
+                summary = list(csv.DictReader(stream))
+            exp2 = next(r for r in summary if r["experiment"] == "Exp2")
+            self.assertAlmostEqual(float(exp2["mean_ping_avg_rtt_ms"]), 102.0)
+            self.assertAlmostEqual(float(exp2["mean_min_rtt_ms"]), 100.6)
+            self.assertEqual(len([r for r in summary if r["experiment"] == "Exp4"]), 4)
+            try:
+                import matplotlib  # noqa: F401
+            except ImportError:
+                return
+            import plot_results
+            matplotlib.use("Agg")
+            plots = out / "plots"
+            plots.mkdir()
+            raw = plot_results.load_rows(out / "raw.csv")
+            plot_results.plot_rtt(raw, plots)
+            plot_results.plot_fairness(raw, plots)
+            names = {p.name for p in plots.iterdir()}
+            self.assertTrue({"rtt_estimate_vs_measured.png", "fairness_reno.png",
+                             "fairness_cubic.png"} <= names)
 
 
 class ReportTableTests(unittest.TestCase):

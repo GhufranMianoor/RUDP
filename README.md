@@ -1,7 +1,7 @@
 # RUDP
 
 Reliable transport over UDP for CS3001: selective repeat with CRC32, SACK,
-receiver flow control, Reno congestion control, RTT/RTO estimation (Karn), a
+receiver flow control, Reno and CUBIC congestion control, RTT/RTO estimation (Karn), a
 routed Mininet topology, and experiments against TCP Reno and CUBIC.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for subnets, addresses, ports and
@@ -15,7 +15,7 @@ has not been verified.
 git clone https://github.com/GhufranMianoor/RUDP.git
 cd RUDP
 sudo scripts/setup_ubuntu.sh        # apt packages + .venv (with system site-packages for Mininet)
-.venv/bin/python -m pytest -q       # 72 tests, ~40 s, no root needed
+.venv/bin/python -m pytest -q       # 87 tests, ~45 s, no root needed
 ```
 
 ## Quick local transfer (no Mininet)
@@ -38,7 +38,8 @@ python tools/loss_soak.py --size-mib 10 --runs 10 --loss 0 2 5   # every SHA mus
 python tools/lossy_proxy.py 9001 127.0.0.1 9000 --drop 0.05      # manual proxy
 ```
 
-Add `--progress` to `send_file.py` to print cwnd, ssthresh, state, RTO and progress
+`send_file.py --cc cubic` uses the CUBIC controller (RFC 8312/9438) instead of
+Reno (the default). Add `--progress` to `send_file.py` to print cwnd, ssthresh, state, RTO and progress
 every 0.5 s.
 
 ## Live POC demo
@@ -80,10 +81,13 @@ sudo .venv/bin/python experiments/run_experiments.py --only Exp1 --runs 3   # on
 | Exp1 | loss 0%, 2%, 5% (per direction) |
 | Exp2 | RTT 20, 100, 200 ms |
 | Exp3 | bottleneck 5, 10, 20 Mbit/s |
-| Exp4 | RUDP (h1->h2) and iperf3 Reno (h3->h4) **concurrently** on 10 Mbit/s |
+| Exp4 | RUDP (h1->h2) and iperf3 (h3->h4) **concurrently** on 10 Mbit/s: `fairness_reno` against TCP Reno, `fairness_cubic` against TCP CUBIC |
 
-Each condition builds a fresh network; every run does RUDP, then iperf3 Reno, then
-iperf3 CUBIC (Exp4: the two concurrent flows). Default 3 runs and a 10 MiB payload
+Each condition builds a fresh network; every run first pings h1 -> h2 on the idle
+path (20 probes, the independently measured RTT), then does RUDP, then iperf3 Reno,
+then iperf3 CUBIC (Exp4: the two concurrent flows). RUDP uses its Reno controller;
+add `--rudp-cc reno cubic` to also run RUDP with the CUBIC controller in Exp1-3
+(rows labelled `RUDP-CUBIC`, about a third more run time). Default 3 runs and a 10 MiB payload
 (`--payload-mib`). **Expect hours at 5% loss**: Reno at 100 ms RTT and 5% loss
 delivers well under 1 Mbit/s, so a 10 MiB transfer takes minutes per run.
 
@@ -106,6 +110,11 @@ How the numbers are defined:
   0.5 s intervals): `overlap_mbps`, `share_of_total` and `fairness_index` (Jain). The
   older per-flow-duration index, which over-states fairness, is kept as
   `fairness_index_own_duration` for comparison only.
+- **Measured RTT** (`ping_avg_rtt_ms`, `ping_min_rtt_ms`): `ping -c 20` from h1 to h2
+  before each run, on the idle path. Exp2 compares it with RUDP's smoothed RTT
+  (`rtt_estimate_s`) and minimum sample (`min_rtt_s`); see
+  `plots/rtt_estimate_vs_measured.png` and the extra Exp2 table in `report_tables.md`.
+  With loss, some probes are lost; `ping_loss_pct` records how many.
 - **Queueing delay** (`queue_delay_ms`) = RUDP smoothed RTT minus the minimum RTT seen
   in the run; with no loss it is mostly the bottleneck queue.
 - A failed transfer (hash mismatch, timeout) is kept in `raw.csv` with `ok=False` and

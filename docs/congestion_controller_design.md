@@ -10,7 +10,7 @@
 
 This document specifies the architecture, formal interfaces, and mathematical foundations for:
 1. **RTT Sampling Hooks & Karn's Algorithm** (RFC 6298): Accurate sender-side Round-Trip Time measurement that avoids the retransmission ambiguity problem.
-2. **Congestion Controller Interface** (RFC 5681): An extensible protocol interface decoupling transport mechanics from congestion control algorithms (supporting `NullController`, `RenoController`, and future stretch goals such as `CubicController`).
+2. **Congestion Controller Interface** (RFC 5681): An extensible protocol interface decoupling transport mechanics from congestion control algorithms (supporting `NullController`, `RenoController`, and `CubicController`, the CUBIC stretch goal; see REPORT.md section 4.3.1).
 3. **Structured Metrics & Telemetry**: JSON-lines event logging of congestion window (`cwnd`), slow-start threshold (`ssthresh`), controller state, and RTT samples for experimental evaluation across the routed topology.
 
 ---
@@ -186,7 +186,7 @@ This telemetry feeds directly into Member 3's analysis scripts and Member 2's We
 | `rudp/hooks.py` | Unified export of controllers and RTT hooks for backward compatibility. |
 | `rudp/sender.py` | Sender integration with `RTTSampler` and duplicate ACK signalling. |
 | `rudp/connection.py` | Pluggable controller parameter in `Connection`. |
-| `apps/send_file.py` | CLI flags `--cc {reno,null}` and `--log` for experiment runs. |
+| `apps/send_file.py` | CLI flags `--cc {reno,cubic,null}` and `--log` for experiment runs. |
 | `tests/test_rtt.py` | 7 unit tests verifying RTT sampling, Karn's algorithm, and edge cases. |
 | `tests/test_controller.py` | 7 unit tests verifying Slow Start, Congestion Avoidance, Fast Retransmit, Recovery, and Timeout. |
 | `tests/test_sender.py` | Expanded sender tests testing RTT integration, Karn's algorithm, and Reno dynamics. |
@@ -206,7 +206,8 @@ This telemetry feeds directly into Member 3's analysis scripts and Member 2's We
   - Full end-to-end integration across routed topology with Member 3.
   - Verification of cwnd sawtooth pattern under packet loss.
 - **Week 4: Tuning and Stretch Goal (CUBIC-style variant)**:
-  - Implementation of `CubicController` ($W_{cubic}(t) = C(t - K)^3 + W_{max}$).
+  - Implementation of `CubicController` ($W_{cubic}(t) = C(t - K)^3 + W_{max}$): done,
+    `rudp/controller.py`, tested in `tests/test_cubic.py`.
 - **Week 5: CWND and RTT Results Analysis**:
   - Plotting cwnd over time, queue delay analysis, technical report contribution.
 

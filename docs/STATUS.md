@@ -8,7 +8,7 @@ kernel module.
 
 | Item | Evidence |
 |---|---|
-| Protocol, unit + localhost impairment tests | 72 tests pass: SACK cap and ordering, >3 gaps, SYN / SYN+ACK / FIN / FIN+ACK loss, duplication, reordering, corruption, 20% loss, idle and stall time-outs, zero window, once-per-window Reno response, one response per timeout episode, new loss event during SACK recovery, overlap-window fairness |
+| Protocol, unit + localhost impairment tests | 87 tests pass: SACK cap and ordering, >3 gaps, SYN / SYN+ACK / FIN / FIN+ACK loss, duplication, reordering, corruption, 20% loss, idle and stall time-outs, zero window, once-per-window Reno response, one response per timeout episode, new loss event during SACK recovery, overlap-window fairness, CUBIC controller (beta, fast convergence, K, concave/convex growth, TCP-friendly region, RTO), CUBIC transfers at 5% loss, ping parsing, summary/plots with ping RTT and CUBIC fairness |
 | Protocol under loss | `tools/loss_soak.py`, 10 MiB x 10 runs at 0/2/5% loss through the proxy: 30/30 SHA-256 matches, no hangs, receiver always exits |
 | Topology | Real Mininet 2.3 + Open vSwitch (userspace datapath), real `tbf`: ping h1->h2 and h3->h4, traceroute `10.0.1.1 -> 10.0.2.2 -> 10.0.3.10`, iperf3 TCP 94% of 10 Mbit/s, RUDP h1->h2 across both routers with matching SHA-256 |
 | Experiment runner | Real Mininet, Exp3 + Exp4, 1 run, 2 MiB: fresh network per condition, SHA-checked RUDP, iperf3 Reno/CUBIC, concurrent Exp4, CSV output, tcpdump capture inside R1 |
@@ -30,6 +30,10 @@ kernel module.
   `docs/SCREENSHOT_CHECKLIST.md`.
 - **`tools/live_demo.py` in real Mininet**, including `tc qdisc change` of netem while
   tbf stays attached as its child. Rehearse it once before the live demo.
+- **Version 2.3 additions in Mininet**: the per-run ping (`ping_avg_rtt_ms` in `raw.csv`),
+  `Exp4 fairness_cubic`, and `--rudp-cc reno cubic`. Tested only with unit tests and a
+  localhost run through the lossy proxy (4 MiB, 50 ms RTT, 1% loss: Reno and CUBIC
+  both SHA-256 correct).
 - **The fifth capture** (`flow-control`) and the Exp4 overlap fairness with real iperf3.
 
 - **Architecture figure**: `docs/figures/architecture.svg/.png` is done and matches the proposal's addressing plan; check it against what you actually demo.
@@ -48,5 +52,4 @@ kernel module.
   wire but not used for sampling. Packets acknowledged cumulatively after a hole fills,
   and not SACKed earlier, can give inflated samples.
 - Loss is applied per direction, so ACKs are also lost.
-- The 10 MiB Exp4 fairness measure is over each flow's own duration (see README).
 - iperf3 `-n` under-counts TCP by up to ~3% at 10 MiB (see README).
