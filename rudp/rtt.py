@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import time
 from typing import Callable
 
-from .constants import MAX_RTO, MIN_RTO
+from .constants import MAX_RTO, MIN_RTO, RTO_VARIANCE_FLOOR
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +175,7 @@ class RTTSampler:
             assert st.rttvar is not None
             st.rttvar = 0.75 * st.rttvar + 0.25 * abs(st.smoothed_rtt - sample_rtt)
             st.smoothed_rtt = 0.875 * st.smoothed_rtt + 0.125 * sample_rtt
-        st.rto = min(MAX_RTO, max(MIN_RTO, st.smoothed_rtt + max(0.001, 4 * st.rttvar)))
+        st.rto = min(MAX_RTO, max(MIN_RTO, st.smoothed_rtt + max(RTO_VARIANCE_FLOOR, 4 * st.rttvar)))
 
         sample = RTTSample(sequence=sequence, rtt=sample_rtt, timestamp=timestamp)
         self._history.append(sample)

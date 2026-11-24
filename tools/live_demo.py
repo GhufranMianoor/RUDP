@@ -159,14 +159,9 @@ def main() -> int:
         banner(f"3. RUDP transfer h1 -> h2 ({args.size_mib:g} MiB, rate {args.rate}); "
                f"network changes at {', '.join(f'{s:g}s' for s, _, _ in phases[1:]) or 'none'}",
                args.pause)
-        if args.capture and shutil.which("dumpcap"):
-            pcap = output / "demo.pcapng"
-            capture = net["R1"].popen(
-                ["dumpcap", "-q", "-i", net.interface_names["R1_lan"], "-f", "udp port 9000",
-                 "-s", "256", "-w", str(pcap)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            time.sleep(1.0)
+        if args.capture:
+            from pcap_capture import Capture  # topology/pcap_capture.py
+            capture = Capture(net["R1"], net.interface_names["R1_lan"], output / "demo.pcapng")
         receiver = net["h2"].popen(
             [sys.executable, str(ROOT / "apps/recv_file.py"), "9000", str(received),
              "--idle-timeout", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
@@ -198,9 +193,8 @@ def main() -> int:
         reader.join(timeout=5)
         receiver.wait(timeout=60)
         if capture is not None:
-            time.sleep(0.5)
-            capture.terminate()
-            capture.wait(timeout=10)
+            saved = capture.stop()
+            print(f"  capture: {saved}" if saved else f"  capture failed: {capture.error.strip()}")
             capture = None
 
         banner("4. Result", args.pause)
@@ -219,7 +213,7 @@ def main() -> int:
         return 0 if same and sender.returncode == 0 else 1
     finally:
         if capture is not None:
-            capture.terminate()
+            capture.kill()
         net.stop()
         received.unlink(missing_ok=True)
 

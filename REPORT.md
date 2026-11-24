@@ -18,7 +18,8 @@ The experimental topology uses two Linux routers and four end hosts. The
 left hosts use `10.0.1.0/24`, the router WAN uses `10.0.2.0/24`, and the right
 hosts use `10.0.3.0/24`. Full interface addresses and static routes are listed
 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). RUDP data uses UDP 9000;
-the TCP baseline uses iperf3 on TCP 5201.
+the TCP baseline uses Linux TCP (Reno or CUBIC) on TCP 5201, through
+`apps/tcp_bulk.py`; iperf3 is used only for the topology's rate check.
 
 ![Figure 1: network architecture and addressing plan](docs/figures/architecture.png)
 
@@ -171,8 +172,16 @@ The sender records the send time of each packet. When a packet that was sent
 exactly once is acknowledged, the elapsed time is an RTT sample (Karn's
 algorithm discards samples from retransmitted packets, whose ACK is
 ambiguous). The estimator follows RFC 6298: SRTT and RTTVAR with gains 1/8
-and 1/4, RTO = SRTT + 4 x RTTVAR, clamped to [0.2 s, 5 s]; the initial RTO is
-1 s. A timeout doubles the RTO until a new valid sample arrives.
+and 1/4, RTO = SRTT + max(G, 4 x RTTVAR) with G = 0.2 s, clamped to [0.2 s, 5 s];
+the initial RTO is 1 s. A timeout doubles the RTO until a new valid sample
+arrives. G is the clock granularity in RFC 6298, but because RUDP samples every
+ACK, RTTVAR decays to about 1 ms on a steady path and RTO fell to SRTT + 1 ms.
+In the first lab run at 200 ms RTT and 0% loss, a retransmission queued behind
+a full bottleneck queue (up to 120 ms) then timed out spuriously over and over,
+and cwnd stayed below 50 packets. With a 0.2 s margin (as Linux TCP uses) the
+same 200 ms path on our localhost bottleneck emulator went from 1.7 to 6.0 Mbit/s
+(Reno) and from 3.1 to 7.3 Mbit/s (CUBIC), with timeouts falling from 17 and 11 to
+1 and 0; at 2% and 5% random loss goodput was unchanged.
 
 ### 4.5 Design choices
 
@@ -253,7 +262,7 @@ must label.
 Each condition runs in a freshly built network with a fixed 100-packet
 drop-tail queue at the bottleneck. Every run sends one 10 MiB file
 (deterministic pseudo-random content, SHA-256 checked for RUDP) with RUDP Reno
-(h1 to h2, UDP 9000), then TCP Reno and TCP CUBIC with iperf3 (h3 to h4, TCP
+(h1 to h2, UDP 9000), then TCP Reno and TCP CUBIC with `apps/tcp_bulk.py` (h3 to h4, TCP
 5201). Before each run, 20 ping probes from h1 to h2 on the idle path give an
 RTT measured independently of RUDP. Three runs per condition; tables report
 mean and standard deviation.
@@ -270,18 +279,20 @@ every Exp1 to Exp3 condition; the fairness test (proposal experiment 5) is
 Exp4 here.
 
 **Metrics.** RUDP goodput is payload bytes divided by the time from the end of
-the handshake to the acknowledged FIN. TCP goodput is iperf3's receiver-side
-`sum_received`; iperf3 `-n` ends when the sender has written the last byte, so
-up to about 0.3 MB still queued at the bottleneck is not counted, which
-under-counts TCP by at most about 3% at 10 MiB. Also recorded: completion time,
-retransmissions (RUDP retransmitted packets; TCP `retransmits` from iperf3),
+the handshake to the acknowledged FIN. TCP goodput is defined the same way: payload
+bytes divided by the receiver-measured time from accepting the connection to the
+last byte (`apps/tcp_bulk.py`). We first used `iperf3 -n`, but it ends the test
+when the sender has written the bytes into its socket; with Linux's
+multi-megabyte send buffer most of a 2 MiB payload was still unsent, and the
+receiver had counted only 12-87% of it. Also recorded: completion time,
+retransmissions (RUDP retransmitted packets; TCP `tcpi_total_retrans` from the sender's `TCP_INFO`),
 and RUDP smoothed and minimum RTT. Failed transfers are kept in `raw.csv` and
 excluded from means. Every RUDP run writes an event log.
 
 **Fairness.** Both flows start together and send 10 MiB each. Throughput is
 measured for both over the **same window**, from when both are delivering to
 when the first one finishes: for RUDP from the acknowledgement times in its
-event log, for TCP from the iperf3 receiver's 0.5 s intervals. Jain's index is
+event log, for TCP from the TCP receiver's 0.5 s intervals. Jain's index is
 J = (x1 + x2)^2 / (2 (x1^2 + x2^2)), 1 for an equal split and 0.5 when one
 flow takes everything. Measuring each flow over its own duration instead
 would over-state fairness, because the flow that finishes second has the link
@@ -341,8 +352,9 @@ passed all SHA-256 checks.
 - RTT is sampled from local send times, not from the timestamp echo. Packets
   acknowledged cumulatively after a hole fills, and not SACKed before, can give
   samples that include the recovery time.
-- iperf3 `-n` under-counts TCP slightly (Section 7).
-- The fairness window is aligned to the iperf3 client's launch time, so it can
+- TCP completion time starts when the receiver accepts the connection, RUDP's
+  after its handshake; both exclude connection setup (Section 7).
+- The fairness window is aligned to the TCP client's launch time, so it can
   be early by about one connection set-up time; this is small against a
   multi-second window.
 - RUDP runs in user-space Python. On the test machine it reached well above

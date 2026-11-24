@@ -81,11 +81,11 @@ sudo .venv/bin/python experiments/run_experiments.py --only Exp1 --runs 3   # on
 | Exp1 | loss 0%, 2%, 5% (per direction) |
 | Exp2 | RTT 20, 100, 200 ms |
 | Exp3 | bottleneck 5, 10, 20 Mbit/s |
-| Exp4 | RUDP (h1->h2) and iperf3 (h3->h4) **concurrently** on 10 Mbit/s, at RTT 20, 100 and 200 ms: `fairness_reno_rtt*` against TCP Reno, `fairness_cubic_rtt*` against TCP CUBIC |
+| Exp4 | RUDP (h1->h2) and TCP (h3->h4) **concurrently** on 10 Mbit/s, at RTT 20, 100 and 200 ms: `fairness_reno_rtt*` against TCP Reno, `fairness_cubic_rtt*` against TCP CUBIC |
 
 Each condition builds a fresh network; every run first pings h1 -> h2 on the idle
-path (20 probes, the independently measured RTT), then does RUDP, then iperf3 Reno,
-then iperf3 CUBIC (Exp4: the two concurrent flows). RUDP uses its Reno controller;
+path (20 probes, the independently measured RTT), then does RUDP, then TCP Reno,
+then TCP CUBIC (Exp4: the two concurrent flows). RUDP uses its Reno controller;
 add `--rudp-cc reno cubic` to also run RUDP with the CUBIC controller in Exp1-3
 (rows labelled `RUDP-CUBIC`, about a third more run time). Default 3 runs and a 10 MiB payload
 (`--payload-mib`). **Expect hours at 5% loss**: Reno at 100 ms RTT and 5% loss
@@ -100,13 +100,15 @@ How the numbers are defined:
 
 - **RUDP goodput** = payload bytes / sender-measured time from the end of the
   handshake to the FIN being acknowledged; the SHA-256 of the received file must match.
-- **TCP goodput** = iperf3 `sum_received` (receiver side). With `-n`, iperf3 stops when the
-  sender has written the last byte, so data still queued at the bottleneck (about
-  0.3 MB) is missing from `sum_received`: TCP is under-counted by up to about 3% at
-  10 MiB. Do not use smaller payloads for TCP comparisons.
+- **TCP goodput** = payload bytes / receiver-measured time from accepting the connection
+  to the last byte, from `apps/tcp_bulk.py` (Linux TCP with `TCP_CONGESTION` set to
+  `reno` or `cubic`). `iperf3 -n` is not used for the transfers: it ends the test when
+  the sender has *written* the bytes into its socket, and with Linux's multi-megabyte
+  send buffer most of them are still unsent, so the server saw only 12-87% of a
+  2 MiB payload on the lab VM. TCP retransmissions come from the sender's `TCP_INFO`.
 - **Exp4 fairness**: both flows send the same number of bytes starting together. Each
   flow's throughput is measured over the same window, from when both deliver data to
-  when the first finishes (RUDP from its event log, TCP from the iperf3 receiver's
+  when the first finishes (RUDP from its event log, TCP from the TCP receiver's
   0.5 s intervals): `overlap_mbps`, `share_of_total` and `fairness_index` (Jain). The
   older per-flow-duration index, which over-states fairness, is kept as
   `fairness_index_own_duration` for comparison only. `summary.csv` gives the mean,

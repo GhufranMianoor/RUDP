@@ -137,3 +137,22 @@ class RTTSamplerTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class RtoMarginTests(unittest.TestCase):
+    """RTTVAR decays on a stable path; RTO must still keep a margin above SRTT."""
+
+    def test_rto_keeps_variance_floor_after_many_identical_samples(self):
+        from rudp.constants import RTO_VARIANCE_FLOOR
+        from rudp.controller import RenoController
+
+        controller = RenoController()
+        for _ in range(2000):
+            controller.observe_rtt(0.200)
+        self.assertGreaterEqual(controller.rto(), 0.200 + RTO_VARIANCE_FLOOR - 1e-9)
+
+        sampler = RTTSampler()
+        for sequence in range(2000):
+            sampler.on_packet_sent(sequence, float(sequence))
+            sampler.on_packet_acked(sequence, float(sequence) + 0.200)
+        self.assertGreaterEqual(sampler.stats.rto, 0.200 + RTO_VARIANCE_FLOOR - 1e-9)

@@ -51,12 +51,6 @@ DISSECTOR_FILTERS = {
 }
 
 
-def capture_command(interface: str, pcap: Path) -> list[str]:
-    if shutil.which("dumpcap"):
-        return ["dumpcap", "-q", "-i", interface, "-f", "udp port 9000", "-s", "512", "-w", str(pcap)]
-    raise SystemExit("dumpcap is required for pcapng output (sudo apt install wireshark-common tshark)")
-
-
 def tshark_as_user(args: list[str]) -> str | None:
     """Run tshark as the invoking user: Wireshark refuses Lua as root."""
 
@@ -78,6 +72,7 @@ def main() -> int:
     if os.geteuid() != 0:
         raise SystemExit("run as root: sudo .venv/bin/python tools/capture_evidence.py")
     import topo
+    from pcap_capture import Capture
 
     pcaps = args.results / "pcaps"
     evidence = args.results / "evidence"
@@ -103,11 +98,7 @@ def main() -> int:
         net = topo.build_network(delay, loss, rate)
         capture = None
         try:
-            capture = net["R1"].popen(
-                capture_command(net.interface_names["R1_lan"], pcap),
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-            time.sleep(1.0)
+            capture = Capture(net["R1"], net.interface_names["R1_lan"], pcap, snaplen=512)
             receiver = net["h2"].popen(
                 [sys.executable, str(ROOT / "apps/recv_file.py"), "9000", str(received),
                  "--idle-timeout", "60", *window_args],
@@ -124,13 +115,14 @@ def main() -> int:
             print(f"  transfer {'OK (SHA-256 identical)' if ok else 'FAILED'}: {out.strip()}")
             failures += 0 if ok else 1
         finally:
-            if capture is not None:
-                time.sleep(0.5)
-                capture.terminate()
-                capture.wait(timeout=10)
+            saved = capture.stop() if capture is not None else None
             net.stop()
             received.unlink(missing_ok=True)
-        pcap.chmod(0o644)
+        if saved is None:
+            print(f"  NO TRACE for {name}; see the capture message above")
+            failures += 1
+            continue
+        pcap = saved
         size_kb = pcap.stat().st_size / 1024
         print(f"  wrote {pcap} ({size_kb:.0f} KiB)")
 

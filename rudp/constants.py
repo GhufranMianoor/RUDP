@@ -16,6 +16,12 @@ DEFAULT_WINDOW = 1024
 DEFAULT_RTO = 1.0
 MIN_RTO = 0.2
 MAX_RTO = 5.0
+# Smallest margin the RTO keeps above SRTT (RFC 6298's max(G, 4*RTTVAR) with G
+# raised from the clock granularity). RTTVAR is updated on every ACK, so on a
+# stable path it decays to ~1 ms and RTO collapses onto SRTT; a retransmission
+# that then waits behind a full bottleneck queue (100 packets = 120 ms at
+# 10 Mbit/s) times out spuriously. Linux keeps a 200 ms margin for the same reason.
+RTO_VARIANCE_FLOOR = 0.2
 HEADER_SIZE = 32
 # Number of SACKed packets above a hole needed to declare it lost.
 DUP_ACK_THRESHOLD = 3
